@@ -9,15 +9,9 @@ control_nav  — main perturbative solver
 load_*       — preset factory functions
 """
 
-import os
-import time
 
 import numpy as np
-import scipy as sp
 from scipy.interpolate import RegularGridInterpolator
-
-import skfmm
-from tqdm import tqdm
 
 from numba_kernel import (
     kernel_T1_noncons,     kernel_T1_cons,
@@ -504,38 +498,6 @@ class control_nav:
         return vx, vy
 
     # ── Path integration ──────────────────────────────────────────────────────
-
-    def path_FMM(self, order, start_coords, step_size=0.01, n_steps=5000, r_stop=0.1):
-        """Trace an optimal path using Fast Marching + gradient descent."""
-        x0, y0 = start_coords
-        xr     = np.linspace(-self.Lx / 2, self.Lx / 2, self.Nx)
-        yr     = np.linspace(-self.Ly / 2, self.Ly / 2, self.Ny)
-
-        vx, vy = self.velocity_field(order)
-        phi    = np.ones_like(vx)
-        phi[self.Nx // 2, self.Ny // 2] = 0
-        t_map  = skfmm.travel_time(phi, np.hypot(vx, vy))
-
-        gx, gy = np.gradient(t_map, xr, yr)
-        igx    = RegularGridInterpolator((xr, yr), gx,
-                                         bounds_error=False, fill_value=None)
-        igy    = RegularGridInterpolator((xr, yr), gy,
-                                         bounds_error=False, fill_value=None)
-
-        curr = np.array([x0, y0], float)
-        xs, ys = [x0], [y0]
-        for _ in range(n_steps):
-            if not (xr[0] < curr[0] < xr[-1] and yr[0] < curr[1] < yr[-1]):
-                break
-            g   = np.array([igx(curr)[0], igy(curr)[0]])
-            mag = np.linalg.norm(g)
-            if mag < 1e-8:
-                break
-            curr -= (g / mag) * step_size
-            xs.append(curr[0]);  ys.append(curr[1])
-            if np.hypot(*curr) < r_stop:
-                break
-        return np.array(xs), np.array(ys)
 
     def path_RK4(self, order, start_coords, dt=0.05, steps=800, r_stop=0.1):
         """Trace an optimal path using RK4 integration of the velocity field."""
