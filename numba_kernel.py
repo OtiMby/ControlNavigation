@@ -363,3 +363,80 @@ def kernel_T2_dT2dTh_151(
             dT2dTh_out[i, j] = _simp(buf_dT, dr) / D0
 
     return T2_out, dT2dTh_out
+
+# ---------------------------------------------------------------------------
+# Parallel multi-path RK4 tracer
+# ---------------------------------------------------------------------------
+ 
+@njit(cache=True, inline='always')
+def _bl0(g, x0, dx, y0, dy, x, y):
+    """Bilinear sample with zero outside the grid (matches RGI fill_value=0)."""
+    nx, ny = g.shape
+    ix = (x - x0) / dx
+    iy = (y - y0) / dy
+    if ix < 0.0 or ix > nx - 1 or iy < 0.0 or iy > ny - 1:
+        return 0.0
+    i0 = int(ix)
+    j0 = int(iy)
+    if i0 > nx - 2:
+        i0 = nx - 2
+    if j0 > ny - 2:
+        j0 = ny - 2
+    fx = ix - i0
+    fy = iy - j0
+    return (g[i0,   j0  ] * (1.0 - fx) * (1.0 - fy)
+          + g[i0+1, j0  ] * fx          * (1.0 - fy)
+          + g[i0,   j0+1] * (1.0 - fx) * fy
+          + g[i0+1, j0+1] * fx          * fy)
+ 
+ 
+@njit(parallel=True, cache=True)
+def kernel_trace_paths(vx, vy, x0, dx, y0, dy,
+                       starts, dt, max_steps, r_stop, hx, hy):
+    """
+    RK4-integrate many trajectories of the drift field (vx, vy) in parallel.
+ 
+    One prange iteration per start point; each writes its own rows, so there
+    is no data race.  Same stop conditions as control_nav.path_RK4:
+    leave the box |x|>hx or |y|>hy, or enter the disk r < r_stop.
+ 
+    Returns
+    -------
+    xs, ys : (M, max_steps+1) float64   trajectory coordinates (padded)
+    nstep  : (M,) int64                 number of valid points per path
+    """
+    M = starts.shape[0]
+    xs    = np.empty((M, max_steps + 1))
+    ys    = np.empty((M, max_steps + 1))
+    nstep = np.empty(M, dtype=np.int64)
+    rs2   = r_stop * r_stop
+ 
+    for m in prange(M):
+        x = starts[m, 0]
+        y = starts[m, 1]
+        xs[m, 0] = x
+        ys[m, 0] = y
+        cnt = 0
+        for _ in range(max_steps):
+            k1x = _bl0(vx, x0, dx, y0, dy, x, y)
+            k1y = _bl0(vy, x0, dx, y0, dy, x, y)
+            ax  = x + 0.5 * dt * k1x;  ay = y + 0.5 * dt * k1y
+            k2x = _bl0(vx, x0, dx, y0, dy, ax, ay)
+            k2y = _bl0(vy, x0, dx, y0, dy, ax, ay)
+            bx  = x + 0.5 * dt * k2x;  by = y + 0.5 * dt * k2y
+            k3x = _bl0(vx, x0, dx, y0, dy, bx, by)
+            k3y = _bl0(vy, x0, dx, y0, dy, bx, by)
+            cx  = x + dt * k3x;        cy = y + dt * k3y
+            k4x = _bl0(vx, x0, dx, y0, dy, cx, cy)
+            k4y = _bl0(vy, x0, dx, y0, dy, cx, cy)
+ 
+            x += dt / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+            y += dt / 6.0 * (k1y + 2.0 * k2y + 2.0 * k3y + k4y)
+            cnt += 1
+            xs[m, cnt] = x
+            ys[m, cnt] = y
+            if abs(x) > hx or abs(y) > hy or (x * x + y * y) < rs2:
+                break
+        nstep[m] = cnt + 1   # including the start point
+ 
+    return xs, ys, nstep

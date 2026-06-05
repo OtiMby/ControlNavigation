@@ -12,12 +12,105 @@ load_*       — preset factory functions
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
+import sympy as _sp
+import warnings as _warnings
+import json
 
-from numba_kernel import (
+# ---------------------------------------------------------------------------
+# Symbolic angular-derivative helpers
+# ---------------------------------------------------------------------------
+# When an analytic ∂θ / ∂²θ is NOT supplied, the field may be given as a
+# symbolic expression (string or sympy) in the symbols  x, y, R, theta.
+# The angular derivative at fixed R is then obtained EXACTLY with the operator
+#
+#       L = -y ∂/∂x + x ∂/∂y        (≡ ∂/∂θ at fixed R ;  L R = 0 ,  L θ = 1)
+#
+# and lambdified to NumPy.  This replaces the finite-difference fallback,
+# which is unreliable for ∂²θ of a grid-interpolated field (a bilinear
+# interpolant is only C0, so its second derivative is essentially noise).
+#
+# A field that uses np.cos / np.exp / ... cannot be traced symbolically, so
+# the symbolic path requires the closed form (string is simplest), e.g.
+#     Mobility(expr="0.1*R*sin(2*theta)")
+#     Force(..., cartesian=False, expr_R="cos(2*theta)", expr_T="1/(1+R)")
+#     Force(..., conservative=False, expr_phi="cos(k*x)**2*cos(k*y)**2", ...)
+
+_SX, _SY = _sp.symbols('x y', real=True)
+_SR  = _sp.sqrt(_SX**2 + _SY**2)
+_STH = _sp.atan2(_SY, _SX)
+_SLOC = dict(x=_SX, y=_SY, X=_SX, Y=_SY, R=_SR, r=_SR,
+             theta=_STH, th=_STH, Theta=_STH,
+             pi=_sp.pi, E=_sp.E,
+             sin=_sp.sin, cos=_sp.cos, tan=_sp.tan,
+             asin=_sp.asin, acos=_sp.acos, atan=_sp.atan, atan2=_sp.atan2,
+             sinh=_sp.sinh, cosh=_sp.cosh, tanh=_sp.tanh,
+             exp=_sp.exp, log=_sp.log, sqrt=_sp.sqrt, Abs=_sp.Abs, sign=_sp.sign)
+
+
+def _to_sym(expr, **consts):
+    """Accept a sympy expression or a string in x, y, R, theta -> sympy expr in x, y.
+
+    Extra named constants (e.g. k=...) may be supplied to resolve symbols that
+    appear in a string expression.
+    """
+    if isinstance(expr, _sp.Basic):
+        return expr
+    loc = dict(_SLOC)
+    loc.update(consts)
+    return _sp.sympify(str(expr).replace('^', '**'), locals=loc)
+
+
+def _Lth(e):
+    """Angular derivative at fixed R:   ∂θ e = -y ∂x e + x ∂y e."""
+    return -_SY * _sp.diff(e, _SX) + _SX * _sp.diff(e, _SY)
+
+
+def _lambdify(e):
+    """sympy expr (in x, y) -> NumPy callable f(X, Y); non-finite (origin) -> 0."""
+    f = _sp.lambdify((_SX, _SY), e, 'numpy')
+
+    def _f(X, Y):
+        X = np.asarray(X, dtype=float)
+        Y = np.asarray(Y, dtype=float)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            out = np.asarray(f(X, Y), dtype=float)
+        shape = np.broadcast(X, Y).shape
+        if out.shape != shape:
+            out = np.broadcast_to(out, shape).astype(float)
+        return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return _f
+
+
+class _SymField:
+    """A field's symbolic form, exposing value / ∂θ / ∂²θ as cached NumPy callables."""
+
+    def __init__(self, expr, **consts):
+        self.expr = _to_sym(expr, **consts)
+        self._f = self._d = self._d2 = None
+
+    def f(self):
+        if self._f is None:
+            self._f = _lambdify(self.expr)
+        return self._f
+
+    def dth(self):
+        if self._d is None:
+            self._d = _lambdify(_Lth(self.expr))
+        return self._d
+
+    def d2th(self):
+        if self._d2 is None:
+            self._d2 = _lambdify(_Lth(_Lth(self.expr)))
+        return self._d2
+
+
+"""from numba_kernel import (
     kernel_T1_noncons,     kernel_T1_cons,
     kernel_dT1dTh_noncons, kernel_dT1dTh_cons,
     kernel_T2_dT2dTh_145,  kernel_T2_dT2dTh_151,
-)
+)"""
+from numba_kernel import *
 
 
 # ---------------------------------------------------------------------------
@@ -39,27 +132,51 @@ class Mobility:
         if omitted.
     """
 
-    def __init__(self, func, dtheta_func=None, d2theta_func=None):
+    def __init__(self, func=None, dtheta_func=None, d2theta_func=None, expr=None,
+                 **consts):
+        # symbolic source of truth (optional)
+        self._sym = _SymField(expr, **consts) if expr is not None else None
+        if func is None:
+            if self._sym is None:
+                raise ValueError("Mobility needs either `func` or `expr`.")
+            func = self._sym.f()
+
         self._func         = func
         self._dtheta_func  = dtheta_func
         self._d2theta_func = d2theta_func
+        self._warned       = False
 
     def __call__(self, X, Y):
         return self._func(X, Y)
 
+    def _warn_fd(self, what):
+        if not self._warned:
+            _warnings.warn(
+                f"Mobility.{what}: no analytic or symbolic derivative supplied; "
+                "falling back to finite differences (inaccurate, esp. for ∂²θ). "
+                "Pass `expr=` or an explicit derivative function.",
+                RuntimeWarning, stacklevel=3)
+            self._warned = True
+
     def dtheta(self, X, Y):
-        """∂θ D — analytical if provided, else centred FD (h = 1e-4)."""
+        """∂θ D — analytic if provided, else exact symbolic, else centred FD."""
         if self._dtheta_func is not None:
             return self._dtheta_func(X, Y)
+        if self._sym is not None:
+            return self._sym.dth()(X, Y)
+        self._warn_fd("dtheta")
         dh    = 1e-4
         R, th = np.hypot(X, Y), np.arctan2(Y, X)
         return (self._func(R * np.cos(th + dh), R * np.sin(th + dh))
               - self._func(R * np.cos(th - dh), R * np.sin(th - dh))) / (2.0 * dh)
 
     def d2theta(self, X, Y):
-        """∂²θ D — analytical if provided, else 2nd-order centred FD (h = 1e-3)."""
+        """∂²θ D — analytic if provided, else exact symbolic, else 2nd-order FD."""
         if self._d2theta_func is not None:
             return self._d2theta_func(X, Y)
+        if self._sym is not None:
+            return self._sym.d2th()(X, Y)
+        self._warn_fd("d2theta")
         dh    = 1e-3
         R, th = np.hypot(X, Y), np.arctan2(Y, X)
         return (self._func(R * np.cos(th + dh), R * np.sin(th + dh))
@@ -97,6 +214,8 @@ class Force:
         potential).  Falls back to centred FD of φ (h = 1e-4) if omitted.
         Only used when conservative=True.
     """
+    def __call__(self, *args, **kwds):
+        print(self._sym_fR)
 
     def __init__(self, Lx, Ly, Nx, Ny,
                  conservative=False,
@@ -107,7 +226,9 @@ class Force:
                  dtheta_fR_func=None,
                  _dpotdth=None,
                  dtheta_fT_func=None,
-                 d2theta_fR_func=None):
+                 d2theta_fR_func=None,
+                 expr_R=None, expr_T=None, expr_phi=None,
+                 **consts):
 
         self.conservative     = conservative
         self.cartesian        = cartesian
@@ -148,14 +269,40 @@ class Force:
                 + f_theta(X, Y) * np.cos(np.arctan2(Y, X))
             )
 
+        # ── symbolic fields (optional) — exact ∂θ replaces FD ────────────────
+        self._warned = False
+        self._sym_fR = self._sym_fT = None
+        self._sym_fx = self._sym_fy = self._sym_phi = None
+
+        if expr_phi is not None:
+            phi = _to_sym(expr_phi, **consts)
+            self._sym_phi = _SymField(phi)
+            if conservative:                       # F = -∇Φ
+                fxs, fys = -_sp.diff(phi, _SX), -_sp.diff(phi, _SY)
+            else:                                  # divergence-free  (∂yΦ, -∂xΦ)
+                fxs, fys =  _sp.diff(phi, _SY), -_sp.diff(phi, _SX)
+            self._sym_fx = _SymField(fxs)
+            self._sym_fy = _SymField(fys)
+            self._sym_fR = _SymField((fxs * _SX + fys * _SY) / _SR)
+            self._sym_fT = _SymField((-fxs * _SY + fys * _SX) / _SR)
+
+        if expr_R is not None:
+            self._sym_fR = _SymField(expr_R, **consts)
+        if expr_T is not None:
+            self._sym_fT = _SymField(expr_T, **consts)
+
     # ── Cartesian components ─────────────────────────────────────────────────
 
     def fx(self, X, Y):
-        if self._potential is not None:
+        if self._sym_fx is not None:
+            return self._sym_fx.f()(X, Y)
+        elif self._potential is not None:
             return self._f_x(np.stack([X, Y], axis=-1))
         return self._f_x(X, Y)
 
     def fy(self, X, Y):
+        if self._sym_fy is not None:
+            return self._sym_fy.f()(X, Y)
         if self._potential is not None:
             return self._f_y(np.stack([X, Y], axis=-1))
         return self._f_y(X, Y)
@@ -163,12 +310,17 @@ class Force:
     # ── Potential ────────────────────────────────────────────────────────────
 
     def potential(self, X, Y):
-        return self._potential(X, Y)
+        if self._potential is not None:
+            return self._potential(X, Y)
+        else:
+            return self._sym_phi.f()(X, Y)
 
     # ── Polar components ─────────────────────────────────────────────────────
 
     def fR(self, X, Y):
         """Radial component f_R at Cartesian (X, Y)."""
+        if self._sym_fR is not None:
+            return self._sym_fR.f()(X, Y)
         if not self.cartesian and self._f_R is not None:
             return self._f_R(X, Y)
         th = np.arctan2(Y, X)
@@ -176,6 +328,8 @@ class Force:
 
     def fT(self, X, Y):
         """Tangential component f_θ at Cartesian (X, Y)."""
+        if self._sym_fT is not None:
+            return self._sym_fT.f()(X, Y)
         if not self.cartesian and self._f_theta is not None:
             return self._f_theta(X, Y)
         th = np.arctan2(Y, X)
@@ -183,28 +337,47 @@ class Force:
 
     # ── Angular derivatives of polar components ──────────────────────────────
 
+    def _warn_fd(self, what):
+        if not self._warned:
+            _warnings.warn(
+                f"Force.{what}: no analytic or symbolic derivative supplied; "
+                "falling back to finite differences (inaccurate, esp. for ∂²θ on "
+                "grid-interpolated/potential fields). Pass expr_R / expr_T / "
+                "expr_phi or an explicit derivative function.",
+                RuntimeWarning, stacklevel=3)
+            self._warned = True
+
     def dtheta_fR(self, X, Y):
-        """∂θ f_R — analytical if provided, else centred FD (h = 1e-4)."""
+        """∂θ f_R — analytic if provided, else exact symbolic, else centred FD."""
         if self._dtheta_fR_func is not None:
             return self._dtheta_fR_func(X, Y)
+        if self._sym_fR is not None:
+            return self._sym_fR.dth()(X, Y)
+        self._warn_fd("dtheta_fR")
         dh    = 1e-4
         R, th = np.hypot(X, Y), np.arctan2(Y, X)
         return (self.fR(R * np.cos(th + dh), R * np.sin(th + dh))
               - self.fR(R * np.cos(th - dh), R * np.sin(th - dh))) / (2.0 * dh)
 
     def dtheta_fT(self, X, Y):
-        """∂θ f_θ — analytical if provided, else centred FD (h = 1e-4)."""
+        """∂θ f_θ — analytic if provided, else exact symbolic, else centred FD."""
         if self._dtheta_fT_func is not None:
             return self._dtheta_fT_func(X, Y)
+        if self._sym_fT is not None:
+            return self._sym_fT.dth()(X, Y)
+        self._warn_fd("dtheta_fT")
         dh    = 1e-4
         R, th = np.hypot(X, Y), np.arctan2(Y, X)
         return (self.fT(R * np.cos(th + dh), R * np.sin(th + dh))
               - self.fT(R * np.cos(th - dh), R * np.sin(th - dh))) / (2.0 * dh)
 
     def d2theta_fR(self, X, Y):
-        """∂²θ f_R — analytical if provided, else 2nd-order centred FD (h = 1e-3)."""
+        """∂²θ f_R — analytic if provided, else exact symbolic, else 2nd-order FD."""
         if self._d2theta_fR_func is not None:
             return self._d2theta_fR_func(X, Y)
+        if self._sym_fR is not None:
+            return self._sym_fR.d2th()(X, Y)
+        self._warn_fd("d2theta_fR")
         dh    = 1e-3
         R, th = np.hypot(X, Y), np.arctan2(Y, X)
         return (self.fR(R * np.cos(th + dh), R * np.sin(th + dh))
@@ -214,11 +387,14 @@ class Force:
     def dtheta_phi(self, X, Y):
         """
         ∂φ/∂θ at fixed R — angular derivative of the potential.
-        Uses analytical dpot if provided, else centred FD of φ (h = 1e-4).
-        Only meaningful for conservative forces.
+        Uses analytic dpot if provided, else exact symbolic (expr_phi),
+        else centred FD of φ (h = 1e-4).  Only meaningful for conservative forces.
         """
         if self.dpot is not None:
             return self.dpot(X, Y)
+        if self._sym_phi is not None:
+            return self._sym_phi.dth()(X, Y)
+        self._warn_fd("dtheta_phi")
         dh    = 1e-4
         R, th = np.hypot(X, Y), np.arctan2(Y, X)
         return (self._potential(R * np.cos(th + dh), R * np.sin(th + dh))
@@ -440,37 +616,60 @@ class control_nav:
     def compute_control_force(self, order):
         """
         Return (cx, cy) for the given perturbative order (0, 1 or 2).
-
-        Prerequisites
-        -------------
-        order >= 1 : compute_T1(), compute_dT1dTh()
-        order == 2 : additionally compute_T2(), compute_dT2dTh()
         """
         eRx, eRy = self._eRx, self._eRy
         eTx, eTy = self._eTx, self._eTy
+        eps = self.epsilon
+        D0 = self.D0
 
-        if order == 0:
-            return -eRx, -eRy
+        cr, cth = -1., 0.
 
-        if order == 1:
-            expr = -self.dT1dTh * self.D0 / self.R
-            return eTx * expr, eTy * expr
+        if order >= 1:
+            cr -= eps * (self.f1.fR(self.X, self.Y) - self.D1(self.X, self.Y))/D0**2
+            cth -= eps * self.dT1dTh / self.R
+            
+        
+        if order == 2:
+            cr -= eps**2 * ( (self.f1.fR(self.X, self.Y)/D0 - self.D1(self.X, self.Y)/D0)**2 + (self.f2.fR(self.X, self.Y) - self.D2(self.X, self.Y))/D0 )
+            cr += eps**2 * 0.5* (self.f1.fT(self.X, self.Y)/D0 - D0 * self.dT1dTh/self.R)**2
+            cth -= eps**2 * self.dT2dTh / self.R
+        
+        
+        cx = cth * eTx + cr * eRx
+        cy = cth * eTy + cr * eRy
+        n = np.hypot(cx, cy)
 
-        # order == 2
-        D1     = self.D1(self.X, self.Y)
-        expr_r = self.dT1dTh**2 * self.D0**2 / (2 * self.R**2)
-        expr_t = (
-            self.dT1dTh * (self.f1.fR(self.X, self.Y) - D1)
-            - self.D0 * self.dT2dTh
-        ) / self.R
-        return (eRx * expr_r + eTx * expr_t,
-                eRy * expr_r + eTy * expr_t)
-
+        return cx/n, cy/n
+    
     def compute_all_control_forces(self):
         """Compute and store c0, c1, c2 for reuse by velocity_field."""
         self.c0x, self.c0y = self.compute_control_force(0)
         self.c1x, self.c1y = self.compute_control_force(1)
         self.c2x, self.c2y = self.compute_control_force(2)
+
+    def compute_order_contribution(self, order):
+        eRx, eRy = self._eRx, self._eRy
+        eTx, eTy = self._eTx, self._eTy
+
+        D0 = self.D0
+        
+        if order == 0:
+            cr, cth = -1., 0.
+        if order == 1:
+            cr =  - self.f1.fR(self.X, self.Y) + self.D1(self.X, self.Y)
+            cth = - self.dT1dTh / self.R
+        
+        if order == 2:
+            cr = - ( (self.f1.fR(self.X, self.Y)/D0 - self.D1(self.X, self.Y)/D0)**2 + (self.f2.fR(self.X, self.Y) - self.D2(self.X, self.Y))/D0 )
+            cr += 0.5*(self.f1.fT(self.X, self.Y)/D0 - D0 * self.dT1dTh/self.R)**2
+            cth = self.dT2dTh / self.R
+
+        cx = cth * eTx + cr * eRx
+        cy = cth * eTy + cr * eRy
+        n = np.hypot(cx, cy)
+
+        return cx/n, cy/n
+
 
     # ── Velocity field ────────────────────────────────────────────────────────
 
@@ -484,16 +683,19 @@ class control_nav:
         D1   = self.D1(self.X, self.Y)
         X, Y = self.X, self.Y
 
-        vx = D0 * self.c0x
-        vy = D0 * self.c0y
+        D = D0
+        fx, fy = 0, 0
+        cx, cy = self.compute_control_force(order)
 
         if order >= 1:
-            vx += ep * (D0 * self.c1x + D1 * self.c0x + self.f1.fx(X, Y))
-            vy += ep * (D0 * self.c1y + D1 * self.c0y + self.f1.fy(X, Y))
+            D += ep * D1
+            fx, fy = fx + ep * self.f1.fx(X, Y), fy + ep * self.f1.fy(X, Y)
 
         if order == 2:
-            vx += ep**2 * (D0 * self.c2x + self.f2.fx(X, Y) + D1 * self.c1x)
-            vy += ep**2 * (D0 * self.c2y + self.f2.fy(X, Y) + D1 * self.c1y)
+            D += ep**2 * self.D2(self.X, self.Y)
+            fx, fy = fx + ep**2 * self.f2.fx(X, Y), fy + ep**2 * self.f2.fy(X, Y)
+
+        vx, vy = D*cx + fx, D*cy+fy
 
         return vx, vy
 
@@ -506,11 +708,11 @@ class control_nav:
         kw     = dict(bounds_error=False, fill_value=0.)
         ifx    = RegularGridInterpolator((xr, yr), vx, **kw)
         ify    = RegularGridInterpolator((xr, yr), vy, **kw)
-
+ 
         def v(xi, yi):
-            p = np.array([xi, yi])
-            return float(ifx(p)), float(ify(p))
-
+            p = np.array([[xi, yi]])   # (1, 2) — requis depuis scipy 1.10
+            return float(ifx(p)[0]), float(ify(p)[0])
+ 
         x, y   = float(start_coords[0]), float(start_coords[1])
         xs, ys = [x], [y]
         for _ in range(steps):
@@ -525,6 +727,39 @@ class control_nav:
                 break
         return np.array(xs), np.array(ys)
 
+
+    def trace_paths(self, vx, vy, starts, dt=0.05, steps=800, r_stop=0.1):
+        """
+        Trace many RK4 trajectories of a given drift field (vx, vy) in
+        parallel across all CPU cores (numba prange).
+ 
+        Parameters
+        ----------
+        vx, vy  : (Nx, Ny) arrays   drift field on the solver grid
+        starts  : (M, 2) array-like start coordinates
+        dt, steps, r_stop           same meaning as path_RK4
+ 
+        Returns
+        -------
+        list of (xs, ys) tuples, one per start point — identical format to
+        path_RK4, so existing plotting code works unchanged.
+        """
+        vx = np.ascontiguousarray(vx, dtype=np.float64)
+        vy = np.ascontiguousarray(vy, dtype=np.float64)
+        xr, yr = self.X[:, 0], self.Y[0, :]
+        x0, dx = float(xr[0]), float(xr[1] - xr[0])
+        y0, dy = float(yr[0]), float(yr[1] - yr[0])
+        starts = np.ascontiguousarray(
+            np.asarray(starts, dtype=np.float64).reshape(-1, 2))
+ 
+        xs, ys, n = kernel_trace_paths(
+            vx, vy, x0, dx, y0, dy, starts,
+            float(dt), int(steps), float(r_stop),
+            self.Lx / 2.0, self.Ly / 2.0)
+ 
+        return list(zip(xs, ys))
+ 
+    
     # ── Validity radius ───────────────────────────────────────────────────────
 
     def compute_eps(self):
@@ -573,6 +808,76 @@ class control_nav:
         constraining = np.minimum(epsesT10, epsesTot)
 
         return epsesTot, epsesT10, constraining
+
+    def compare_paths(self, order, func, n_theta, dt=0.01, r_stop=0.1):
+        """Integration retrograde des caracteristiques depuis l'origine, pour fournir
+        une initialisation robuste (theta, theta_f) au solveur de Newton."""
+
+        eps          = self.epsilon
+        box_x, box_y = 0.9 * self.Lx / 2.0, 0.9 * self.Ly / 2.0
+
+        tf = np.concatenate([np.linspace(-np.pi/2 + eps,   np.pi/2 - eps, n_theta),
+                            np.linspace( np.pi/2 + eps, 3*np.pi/2 - eps, n_theta)])
+        M  = tf.size
+        th = tf + np.pi
+
+        # caractéristiques : intégration vers l'extérieur depuis la cible (vectorisé)
+        nmax = int(np.hypot(self.Lx/2, self.Ly/2) / dt) + 1
+        Xh = np.zeros((nmax + 1, M)); Yh = np.zeros((nmax + 1, M))
+        thk = th.copy()
+        for k in range(nmax):
+            xk, yk = Xh[k], Yh[k]
+            V  = self.D0 + eps * self.D1(xk, yk) + eps**2 * self.D2(xk, yk)   # champs AUX POINTS
+            fx = eps * self.f1.fx(xk, yk) + eps**2 * self.f2.fx(xk, yk)
+            fy = eps * self.f1.fy(xk, yk) + eps**2 * self.f2.fy(xk, yk)
+            Xh[k+1] = xk + dt * (fx + V * np.cos(thk))
+            Yh[k+1] = yk + dt * (fy + V * np.sin(thk))
+            thk     = thk + dt * func(thk)
+
+        outside = (np.abs(Xh) > box_x) | (np.abs(Yh) > box_y)
+        e  = np.where(outside.any(0), outside.argmax(0), nmax)               # index de lancement
+        sp = np.ascontiguousarray(
+            np.column_stack([Xh[e, np.arange(M)], Yh[e, np.arange(M)]]), dtype=np.float64)
+
+        # chemins RK4 perturbatifs depuis les lancements vers la cible
+        vx, vy = self.velocity_field(order)
+        vx = np.ascontiguousarray(vx, dtype=np.float64)
+        vy = np.ascontiguousarray(vy, dtype=np.float64)
+        xr, yr = self.X[:, 0], self.Y[0, :]
+        x0, dx = float(xr[0]), float(xr[1] - xr[0])
+        y0, dy = float(yr[0]), float(yr[1] - yr[0])
+        xs, ys, nstep = kernel_trace_paths(
+            vx, vy, x0, dx, y0, dy, sp,
+            float(dt), int(5000), float(r_stop), self.Lx / 2.0, self.Ly / 2.0)
+
+        def _resample(x, y, L):
+            s = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))))
+            if s[-1] == 0.0:
+                return np.full(L, x[0]), np.full(L, y[0])
+            u = np.linspace(0.0, s[-1], L)
+            return np.interp(u, s, x), np.interp(u, s, y)
+
+        L    = 200
+        err  = np.empty(M)
+        dtau = np.empty(M)
+        for m in range(M):
+            em    = int(e[m])
+            rchar = np.hypot(Xh[:em+1, m], Yh[:em+1, m])
+            kin   = int(np.argmax(rchar >= r_stop))            # 1er passage à r_stop
+            cx, cy = Xh[kin:em+1, m], Yh[kin:em+1, m]           # char : r_stop -> lancement
+
+            nm     = int(nstep[m])
+            rx, ry = xs[m, :nm][::-1], ys[m, :nm][::-1]          # RK4 : r_stop -> lancement
+
+            ax, ay = _resample(cx, cy, L)
+            bx, by = _resample(rx, ry, L)
+            err[m] = np.sqrt(np.mean((ax - bx)**2 + (ay - by)**2))
+
+            t_char  = (em - kin) * dt
+            t_rk4   = (nm - 1)   * dt
+            dtau[m] = (t_rk4 - t_char) / t_char if t_char > 0 else np.nan
+
+        return err, dtau
 
 
 
@@ -671,8 +976,7 @@ def load_divless(Lx, Ly, N):
 
     def pot(x, y):
         k = 2 * np.pi * (6 / Lx)
-        return np.cos(k * x)**4 * np.sin(k * y)**4
-
+        return np.cos(k * x)**2 * np.sin(k * y)**2
     
     def _zero(x, y):
         return np.zeros_like(x)
@@ -698,3 +1002,153 @@ def load_divless2(Lx, Ly, N):
     D2 = Mobility(_zero,dtheta_func=_zero)
     return f1, f2, D1, D2, "div_less2"
 
+def load_cisaillement(Lx, Ly, N):
+    phi="-y**2/2"
+
+    def _zero(x,y):
+        return 0*x
+
+    f1 = Force(Lx, Ly, N, N, expr_phi=phi, conservative=False)
+    f2 = Force(Lx, Ly, N, N, conservative=True, expr_phi="0")
+    D1 = Mobility(expr="0",dtheta_func=_zero)
+    D2 = Mobility(expr="0",dtheta_func=_zero)
+    return f1, f2, D1, D2, "cisaillement"
+
+def load_divless_shifted(Lx, Ly, N):
+
+
+    def _zero(x,y):
+        return 0*x
+
+    f1 = Force(Lx, Ly, N, N, conservative=False, expr_phi=f"cos(12*{1/Lx} * pi  * x)**2*cos(12*{1/Ly} * pi * y - pi/6)**2", cartesian=True)
+    f2 = Force(Lx, Ly, N, N, conservative=False, expr_phi=_zero)
+    D1 = Mobility(_zero,dtheta_func=_zero)
+    D2 = Mobility(_zero,dtheta_func=_zero)
+    return f1, f2, D1, D2, "shifted"
+
+def load_divless_mob(Lx, Ly, N):
+    D1 = "0"
+    pot = f"cos(12*{1/Lx} * pi  * x)**2*cos(12*{1/Ly} * pi * y - pi/6)**2"
+
+    def _zero(x, y):
+        return np.zeros_like(x)
+
+    f1 = Force(Lx, Ly, N, N, conservative=False, expr_phi=pot)
+    f2 = Force(Lx, Ly, N, N, conservative=True, potential=_zero)
+    D1 = Mobility(expr="0",dtheta_func=_zero)
+    D2 = Mobility(expr="0",dtheta_func=_zero)
+    return f1, f2, D1, D2, "div_less_mob2"
+
+def load_multiples(dx):
+    p1 = ("cos(12*1/10 * pi  * x)**2*cos(12*1/10 * pi * y - pi/6)**2", 
+          False,
+          10)
+    p2 = ("cos(12*1/10 * pi  * x)**2*cos(12*1/10 * pi * y - pi/6)**2", 
+          True,
+          10)
+    p3 = ("cos(12*1/10 * pi  * x)**2*cos(12*1/10 * pi * y)**2", 
+          False,
+          10)
+    p4 = ("cos(48*1/40 * pi  * x)**2*cos(48*1/40 * pi * y)**2", 
+          False,
+          40)
+    p5 = ("cos(12*1/10 * pi  * x)**2*cos(12*1/10 * pi * y)**2", 
+          True,
+          10)
+    p6 = ("cos(48*1/40 * pi  * x)**2*cos(48*1/40 * pi * y)**2", 
+          True,
+          40)
+    p7 = ("cos(12*1/10 * pi  * x)**3*cos(12*1/10 * pi * y)**3", 
+          False,
+          10)
+    p8 = ("cos(20*1/20 * pi  * x)**3*cos(20*1/20 * pi * y - pi/6)**3", 
+          False,
+          20)
+    p9 = ("cos(12*1/10 * pi  * x)**3*cos(12*1/10 * pi * y)**3", 
+          True,
+          10)
+
+    p10 = ("cos(6*1/10 * pi  * x)**2*cos(6*1/10 * pi * y)**2", 
+          True,
+          10)
+    p11 = ("cos(6*1/10 * pi  * x)**2*cos(6*1/10 * pi * y)**2", 
+          False,
+          10)
+    
+    p12 = ("cos(20*1/20 * pi  * x)+cos(20*1/20 * pi * y)", 
+          True,
+          20)
+    p13 = ("cos(20*1/20 * pi  * x)+cos(20*1/20 * pi * y)", 
+          False,
+          20)
+    
+    p14 = ("cos(20*1/20 * pi  * x)+cos(20*1/20 * pi * y)", 
+          True,
+          20)
+    p15 = ("cos(20*1/20 * pi  * x)+cos(20*1/20 * pi * y)", 
+          False,
+          20)
+    
+    p16 = ("cos(20*1/20 * pi  * x)*sin(20*1/20 * pi * y)", 
+          True,
+          20)
+    p17 = ("cos(20*1/20 * pi  * x)*sin(20*1/20 * pi * y)", 
+          False,
+          20)
+
+
+    def zero(x, y):
+        return np.zeros_like(x)
+    
+    args = []
+    ps = [p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17]
+    for i, (pot, conservative, L) in enumerate(ps):
+        print(i)
+        N = int(L/dx)
+        f1 = Force(L, L, N, N, conservative=conservative, expr_phi=pot)
+        f2 = Force(L, L, N, N, conservative=False, expr_phi="0")
+        D1 = Mobility(expr="0",dtheta_func=zero)
+        D2 = Mobility(expr="0",dtheta_func=zero)
+        args.append([f1, f2, D1, D2, f"data{i}", pot, L, N])
+        
+    return args
+
+if __name__ == "__main__":
+
+    
+    dx = 0.001
+    D0 = 1.
+
+    funcs = load_multiples(dx)
+    for (f1, f2, D1, D2, SaveStr, eq, L, N) in funcs[:6]:
+        print(f"computing {eq}")
+        cn = control_nav(Lx=L, Ly=L, Nx=N, Ny=N, D0=D0 ,D1=D1, D2=D2, f1=f1, f2=f2, epsilon=0.01)
+        print("Computing T1 ...")
+        cn.compute_T1()
+        print("Computing dT1/dθ ...")
+        cn.compute_dT1dTh()
+        print("Computing T2 ...")
+        cn.compute_T2()
+        print("Computing dT2/dθ ...")
+        cn.compute_dT2dTh()
+        print("computing control forces contributions")
+
+        c0x, c0y = cn.compute_order_contribution(0)
+        c1x, c1y = cn.compute_order_contribution(1)
+        c2x, c2y = cn.compute_order_contribution(2)
+
+        data = {
+            "eq":eq,
+            "T0":cn.T0.tolist(),
+            "T1":cn.T1.tolist(),
+            "T2":cn.T2.tolist(),
+            "dT1dTh":cn.dT1dTh.tolist(),
+            "dT2dTh":cn.dT2dTh.tolist(),
+            "c0": (c0x.tolist(), c0y.tolist()),
+            "c1": (c1x.tolist(), c1y.tolist()),
+            "c2": (c2x.tolist(), c2y.tolist()),
+        }
+
+        with open(f"{SaveStr}.json", "w") as f:
+            json.dump(data, f)
+        
