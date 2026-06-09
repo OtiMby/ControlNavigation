@@ -15,7 +15,7 @@ from scipy.interpolate import RegularGridInterpolator
 import sympy as _sp
 import warnings as _warnings
 import json
-
+import random as rd
 # ---------------------------------------------------------------------------
 # Symbolic angular-derivative helpers
 # ---------------------------------------------------------------------------
@@ -25,9 +25,7 @@ import json
 #
 #       L = -y ∂/∂x + x ∂/∂y        (≡ ∂/∂θ at fixed R ;  L R = 0 ,  L θ = 1)
 #
-# and lambdified to NumPy.  This replaces the finite-difference fallback,
-# which is unreliable for ∂²θ of a grid-interpolated field (a bilinear
-# interpolant is only C0, so its second derivative is essentially noise).
+# and lambdified to NumPy. 
 #
 # A field that uses np.cos / np.exp / ... cannot be traced symbolically, so
 # the symbolic path requires the closed form (string is simplest), e.g.
@@ -35,6 +33,8 @@ import json
 #     Force(..., cartesian=False, expr_R="cos(2*theta)", expr_T="1/(1+R)")
 #     Force(..., conservative=False, expr_phi="cos(k*x)**2*cos(k*y)**2", ...)
 
+
+# Creating Variables for analytical derivations of forces and mobility
 _SX, _SY = _sp.symbols('x y', real=True)
 _SR  = _sp.sqrt(_SX**2 + _SY**2)
 _STH = _sp.atan2(_SY, _SX)
@@ -87,7 +87,7 @@ class _SymField:
 
     def __init__(self, expr, **consts):
         self.expr = _to_sym(expr, **consts)
-        self._f = self._d = self._d2 = None
+        self._f = self._d = self._d2 = self._dx = self._dy = None
 
     def f(self):
         if self._f is None:
@@ -103,13 +103,18 @@ class _SymField:
         if self._d2 is None:
             self._d2 = _lambdify(_Lth(_Lth(self.expr)))
         return self._d2
+    
+    def dx(self, x: float, y: float): 
+        if self._dx is None:
+            self._dx = _lambdify(_sp.diff(self.expr, _SX))
+        return self._dx(x, y)
+
+    def dy(self, x: float, y: float):
+        if self._dy is None:
+            self._dy = _lambdify(_sp.diff(self.expr, _SY))
+        return self._dy(x, y)
 
 
-"""from numba_kernel import (
-    kernel_T1_noncons,     kernel_T1_cons,
-    kernel_dT1dTh_noncons, kernel_dT1dTh_cons,
-    kernel_T2_dT2dTh_145,  kernel_T2_dT2dTh_151,
-)"""
 from numba_kernel import *
 
 
@@ -182,6 +187,20 @@ class Mobility:
         return (self._func(R * np.cos(th + dh), R * np.sin(th + dh))
               - 2.0 * self._func(X, Y)
               + self._func(R * np.cos(th - dh), R * np.sin(th - dh))) / dh**2
+    
+    def dx(self, X, Y):
+        """∂ₓ D — exact si symbolique (expr=), sinon DF centrée."""
+        if self._sym is not None:
+            return self._sym.dx(X, Y)
+        h = 1e-5
+        return (self._func(X + h, Y) - self._func(X - h, Y)) / (2.0 * h)
+
+    def dy(self, X, Y):
+        """∂y D — exact si symbolique (expr=), sinon DF centrée."""
+        if self._sym is not None:
+            return self._sym.dy(X, Y)
+        h = 1e-5
+        return (self._func(X, Y + h) - self._func(X, Y - h)) / (2.0 * h)
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +232,7 @@ class Force:
         Analytical ∂θ φ(r, θ) at fixed r (angular derivative of the
         potential).  Falls back to centred FD of φ (h = 1e-4) if omitted.
         Only used when conservative=True.
-    """
-    def __call__(self, *args, **kwds):
-        print(self._sym_fR)
+    """ 
 
     def __init__(self, Lx, Ly, Nx, Ny,
                  conservative=False,
@@ -399,6 +416,30 @@ class Force:
         R, th = np.hypot(X, Y), np.arctan2(Y, X)
         return (self._potential(R * np.cos(th + dh), R * np.sin(th + dh))
               - self._potential(R * np.cos(th - dh), R * np.sin(th - dh))) / (2.0 * dh)
+    
+    def dfx_dx(self, X, Y):
+        if self._sym_fx is not None:
+            return self._sym_fx.dx(X, Y)
+        h = 1e-5
+        return (self.fx(X + h, Y) - self.fx(X - h, Y)) / (2.0 * h)
+
+    def dfx_dy(self, X, Y):
+        if self._sym_fx is not None:
+            return self._sym_fx.dy(X, Y)
+        h = 1e-5
+        return (self.fx(X, Y + h) - self.fx(X, Y - h)) / (2.0 * h)
+
+    def dfy_dx(self, X, Y):
+        if self._sym_fy is not None:
+            return self._sym_fy.dx(X, Y)
+        h = 1e-5
+        return (self.fy(X + h, Y) - self.fy(X - h, Y)) / (2.0 * h)
+
+    def dfy_dy(self, X, Y):
+        if self._sym_fy is not None:
+            return self._sym_fy.dy(X, Y)
+        h = 1e-5
+        return (self.fy(X, Y + h) - self.fy(X, Y - h)) / (2.0 * h)
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +460,6 @@ class control_nav:
     cn.compute_dT1dTh()
     cn.compute_T2()          # also computes dT2dTh internally
     cn.compute_dT2dTh()      # no-op if compute_T2 was already called
-    cn.compute_all_control_forces()
-    # cn.T0, cn.T1, cn.T2, cn.c0x/y, cn.c1x/y, cn.c2x/y are now available.
 
     Parameters
     ----------
@@ -443,7 +482,6 @@ class control_nav:
         self.D0          = D0
         self.D1, self.D2 = D1, D2
         self.f1, self.f2 = f1, f2
-        self.epsilon     = epsilon
 
         # Nr must be odd for composite Simpson's rule
         Nr       = int(np.hypot(Nx, Ny))
@@ -613,13 +651,12 @@ class control_nav:
 
     # ── Control force ─────────────────────────────────────────────────────────
 
-    def compute_control_force(self, order):
+    def compute_control_force(self, order, eps):
         """
         Return (cx, cy) for the given perturbative order (0, 1 or 2).
         """
         eRx, eRy = self._eRx, self._eRy
         eTx, eTy = self._eTx, self._eTy
-        eps = self.epsilon
         D0 = self.D0
 
         cr, cth = -1., 0.
@@ -641,51 +678,21 @@ class control_nav:
 
         return cx/n, cy/n
     
-    def compute_all_control_forces(self):
-        """Compute and store c0, c1, c2 for reuse by velocity_field."""
-        self.c0x, self.c0y = self.compute_control_force(0)
-        self.c1x, self.c1y = self.compute_control_force(1)
-        self.c2x, self.c2y = self.compute_control_force(2)
-
-    def compute_order_contribution(self, order):
-        eRx, eRy = self._eRx, self._eRy
-        eTx, eTy = self._eTx, self._eTy
-
-        D0 = self.D0
-        
-        if order == 0:
-            cr, cth = -1., 0.
-        if order == 1:
-            cr =  - self.f1.fR(self.X, self.Y) + self.D1(self.X, self.Y)
-            cth = - self.dT1dTh / self.R
-        
-        if order == 2:
-            cr = - ( (self.f1.fR(self.X, self.Y)/D0 - self.D1(self.X, self.Y)/D0)**2 + (self.f2.fR(self.X, self.Y) - self.D2(self.X, self.Y))/D0 )
-            cr += 0.5*(self.f1.fT(self.X, self.Y)/D0 - D0 * self.dT1dTh/self.R)**2
-            cth = self.dT2dTh / self.R
-
-        cx = cth * eTx + cr * eRx
-        cy = cth * eTy + cr * eRy
-        n = np.hypot(cx, cy)
-
-        return cx/n, cy/n
-
 
     # ── Velocity field ────────────────────────────────────────────────────────
 
-    def velocity_field(self, order):
+    def velocity_field(self, order, ep):
         """
         Assemble the total drift velocity (vx, vy) at the given perturbative
-        order.  Requires compute_all_control_forces() to have been called.
+        order for given epsilon. 
         """
-        ep   = self.epsilon
         D0   = self.D0
         D1   = self.D1(self.X, self.Y)
         X, Y = self.X, self.Y
 
         D = D0
         fx, fy = 0, 0
-        cx, cy = self.compute_control_force(order)
+        cx, cy = self.compute_control_force(order, ep)
 
         if order >= 1:
             D += ep * D1
@@ -701,9 +708,9 @@ class control_nav:
 
     # ── Path integration ──────────────────────────────────────────────────────
 
-    def path_RK4(self, order, start_coords, dt=0.05, steps=800, r_stop=0.1):
+    def path_RK4(self, order, start_coords, eps, dt=0.05, steps=800, r_stop=0.1):
         """Trace an optimal path using RK4 integration of the velocity field."""
-        vx, vy = self.velocity_field(order)
+        vx, vy = self.velocity_field(order, eps)
         xr, yr = self.X[:, 0], self.Y[0, :]
         kw     = dict(bounds_error=False, fill_value=0.)
         ifx    = RegularGridInterpolator((xr, yr), vx, **kw)
@@ -780,7 +787,7 @@ class control_nav:
         disc = T1**2 + 4 * T2 * T0
         with np.errstate(divide='ignore', invalid='ignore'):
             root = np.where(T2 > tol,
-                            (T1 + np.sqrt(np.maximum(disc, 0))) / (2 * T2),
+                            (- T1 + np.sqrt(np.maximum(disc, 0))) / (2 * T2),
                             np.where(T1 > tol, T0 / T1, np.inf))
         eps_tot = np.where(T0 > tol, root, np.inf)
 
@@ -809,38 +816,55 @@ class control_nav:
 
         return epsesTot, epsesT10, constraining
 
-    def compare_paths(self, order, func, n_theta, dt=0.01, r_stop=0.1):
-        """Integration retrograde des caracteristiques depuis l'origine, pour fournir
-        une initialisation robuste (theta, theta_f) au solveur de Newton."""
+    def compare_paths(self, order, func, n_theta, eps, dt=0.002, r_stop=0.1, Npaths=0):
+        """Compare les trajectoires perturbatives (RK4 sur velocity_field) aux
+        caractéristiques optimales EXACTES de
+            ẋ = D(x)·(cosθ, sinθ) + F(x),   |c| = 1.
 
-        eps          = self.epsilon
-        box_x, box_y = 0.9 * self.Lx / 2.0, 0.9 * self.Ly / 2.0
+        Caractéristiques obtenues par intégration RÉTROGRADE du flot optimal
+        depuis la cible (origine), avec la MÊME loi `func` (make_theta_eq) que
+        celle définissant le modèle — cohérence vitesse/pilotage à mobilité
+        variable. Renvoie (err, dtau) par trajectoire (RMS spatial resamplé par
+        abscisse curviligne, erreur temporelle relative). Les trajectoires non
+        valides (jamais sorties de la boîte, ou RK4 n'atteignant pas la cible)
+        valent NaN -> utiliser np.nanmean en aval.
+        """
+        box_x, box_y = 0.9*self.Lx/2.0, 0.9*self.Ly/2.0
+        GAP          = 1e-3   # écart aux singularités cosθ=0, INDÉPENDANT de eps
 
-        tf = np.concatenate([np.linspace(-np.pi/2 + eps,   np.pi/2 - eps, n_theta),
-                            np.linspace( np.pi/2 + eps, 3*np.pi/2 - eps, n_theta)])
+        tf = np.concatenate([np.linspace(-np.pi/2 + GAP,   np.pi/2 - GAP,   n_theta//2),
+                             np.linspace( np.pi/2 + GAP, 3*np.pi/2 - GAP,   n_theta//2)])
         M  = tf.size
-        th = tf + np.pi
 
-        # caractéristiques : intégration vers l'extérieur depuis la cible (vectorisé)
-        nmax = int(np.hypot(self.Lx/2, self.Ly/2) / dt) + 1
-        Xh = np.zeros((nmax + 1, M)); Yh = np.zeros((nmax + 1, M))
-        thk = th.copy()
+        # --- caractéristiques exactes : rétrograde depuis la cible ----------
+        Vc   = self.D0
+        nmax = int(3.0*np.hypot(self.Lx, self.Ly)/(dt*Vc)) + 100
+        Xh, Yh = np.zeros((nmax + 1, M)), np.zeros((nmax + 1, M))
+        th = tf.copy()                                  # cap AU but, pas de +pi
         for k in range(nmax):
             xk, yk = Xh[k], Yh[k]
-            V  = self.D0 + eps * self.D1(xk, yk) + eps**2 * self.D2(xk, yk)   # champs AUX POINTS
-            fx = eps * self.f1.fx(xk, yk) + eps**2 * self.f2.fx(xk, yk)
-            fy = eps * self.f1.fy(xk, yk) + eps**2 * self.f2.fy(xk, yk)
-            Xh[k+1] = xk + dt * (fx + V * np.cos(thk))
-            Yh[k+1] = yk + dt * (fy + V * np.sin(thk))
-            thk     = thk + dt * func(thk)
+            V  = self.D0 + eps*self.D1(xk, yk) + eps**2*self.D2(xk, yk)
+            fx = eps*self.f1.fx(xk, yk) + eps**2*self.f2.fx(xk, yk)
+            fy = eps*self.f1.fy(xk, yk) + eps**2*self.f2.fy(xk, yk)
+            c, s = np.cos(th), np.sin(th)
+            Xh[k+1] = xk - dt*(fx + V*c)                # d/dτ = -(flot avant)
+            Yh[k+1] = yk - dt*(fy + V*s)
+            th      = th - dt*func(th, xk, yk, eps)
 
         outside = (np.abs(Xh) > box_x) | (np.abs(Yh) > box_y)
-        e  = np.where(outside.any(0), outside.argmax(0), nmax)               # index de lancement
+        left    = outside.any(0)
+        e       = np.where(left, outside.argmax(0), nmax)
+        if not left.all():
+            _warnings.warn(
+                f"compare_paths: {int((~left).sum())}/{M} caractéristiques "
+                "n'ont pas atteint la boîte (nmax trop petit ou extrémale "
+                "divergente) ; marquées NaN.", RuntimeWarning, stacklevel=2)
         sp = np.ascontiguousarray(
-            np.column_stack([Xh[e, np.arange(M)], Yh[e, np.arange(M)]]), dtype=np.float64)
+            np.column_stack([Xh[e, np.arange(M)], Yh[e, np.arange(M)]]),
+            dtype=np.float64)
 
-        # chemins RK4 perturbatifs depuis les lancements vers la cible
-        vx, vy = self.velocity_field(order)
+        # --- RK4 perturbatif depuis les lancements vers la cible ------------
+        vx, vy = self.velocity_field(order, eps)
         vx = np.ascontiguousarray(vx, dtype=np.float64)
         vy = np.ascontiguousarray(vy, dtype=np.float64)
         xr, yr = self.X[:, 0], self.Y[0, :]
@@ -848,7 +872,7 @@ class control_nav:
         y0, dy = float(yr[0]), float(yr[1] - yr[0])
         xs, ys, nstep = kernel_trace_paths(
             vx, vy, x0, dx, y0, dy, sp,
-            float(dt), int(5000), float(r_stop), self.Lx / 2.0, self.Ly / 2.0)
+            float(dt), int(5000), float(r_stop), self.Lx/2.0, self.Ly/2.0)
 
         def _resample(x, y, L):
             s = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))))
@@ -858,27 +882,75 @@ class control_nav:
             return np.interp(u, s, x), np.interp(u, s, y)
 
         L    = 200
-        err  = np.empty(M)
-        dtau = np.empty(M)
+        err  = np.full(M, np.nan)
+        dtau = np.full(M, np.nan)
         for m in range(M):
+            if not left[m]:
+                continue
             em    = int(e[m])
             rchar = np.hypot(Xh[:em+1, m], Yh[:em+1, m])
-            kin   = int(np.argmax(rchar >= r_stop))            # 1er passage à r_stop
-            cx, cy = Xh[kin:em+1, m], Yh[kin:em+1, m]           # char : r_stop -> lancement
+            if not (rchar >= r_stop).any():
+                continue
+            kin    = int(np.argmax(rchar >= r_stop))     # 1er passage à r_stop
+            cx, cy = Xh[kin:em+1, m], Yh[kin:em+1, m]     # char : r_stop -> lancement
 
-            nm     = int(nstep[m])
-            rx, ry = xs[m, :nm][::-1], ys[m, :nm][::-1]          # RK4 : r_stop -> lancement
+            nm = int(nstep[m])
+            # le RK4 doit avoir atteint la cible (sinon extrémale/troncature KO)
+            if np.hypot(xs[m, nm-1], ys[m, nm-1]) > 2.0*r_stop:
+                continue
+            rx, ry = xs[m, :nm][::-1], ys[m, :nm][::-1]   # RK4 : r_stop -> lancement
 
             ax, ay = _resample(cx, cy, L)
             bx, by = _resample(rx, ry, L)
             err[m] = np.sqrt(np.mean((ax - bx)**2 + (ay - by)**2))
 
-            t_char  = (em - kin) * dt
-            t_rk4   = (nm - 1)   * dt
-            dtau[m] = (t_rk4 - t_char) / t_char if t_char > 0 else np.nan
+            t_char  = (em - kin)*dt
+            t_rk4   = (nm - 1)*dt
+            dtau[m] = (t_rk4 - t_char)/t_char if t_char > 0 else np.nan
 
+        if Npaths:
+            valid = np.where(np.isfinite(err))[0]      # n'échantillonne que les valides
+            if valid.size == 0:
+                return err, dtau, [[], []]
+            k   = min(Npaths, valid.size)
+            ids = np.random.choice(valid, size=k, replace=False)
+
+            anpath = []   # caractéristiques exactes : origine -> lancement
+            rk4  = []   # chemins RK4 perturbatifs : lancement -> cible
+            for j in ids:
+                ej = int(e[j])                          # index de lancement
+                anpath.append((Xh[:ej+1, j].copy(), Yh[:ej+1, j].copy()))
+                nj = int(nstep[j])                      # nb de pas valides du RK4
+                rk4.append((xs[j, :nj].copy(), ys[j, :nj].copy()))
+            return err, dtau, [anpath, rk4]
+        
         return err, dtau
 
+    def make_theta_eq(self,th,x,y, e):
+        """Loi de pilotage de Zermelo à VITESSE VARIABLE pour le modèle
+            ẋ = D(x)·(cosθ, sinθ) + F(x),   |c| = 1,   D = D0 + ε D1 + ε² D2.
+
+            θ̇ = sin²θ ∂ₓv + sinθcosθ(∂ₓu − ∂yv) − cos²θ ∂yu
+                + (sinθ ∂ₓD − cosθ ∂yD)
+
+        avec u=F_x=εf1x+ε²f2x, v=F_y=εf1y+ε²f2y, D=D0+εD1+ε²D2.
+        """
+
+        dudx = e*self.f1.dfx_dx(x, y) + e**2*self.f2.dfx_dx(x, y)
+        dudy = e*self.f1.dfx_dy(x, y) + e**2*self.f2.dfx_dy(x, y)
+        dvdx = e*self.f1.dfy_dx(x, y) + e**2*self.f2.dfy_dx(x, y)
+        dvdy = e*self.f1.dfy_dy(x, y) + e**2*self.f2.dfy_dy(x, y)
+
+        dDdx = e*self.D1.dx(x, y) + e**2*self.D2.dx(x, y)
+        dDdy = e*self.D1.dy(x, y) + e**2*self.D2.dy(x, y)
+
+        s, c     = np.sin(th), np.cos(th)
+        classical = s*s*dvdx + s*c*(dudx - dvdy) - c*c*dudy
+        mobility  = s*dDdx - c*dDdy
+        return classical + mobility
+
+def nul(x, y):
+    return np.zeros_like(x)
 
 
 def load_compare(Lx, Ly, N):
@@ -888,7 +960,7 @@ def load_compare(Lx, Ly, N):
     Analytical polar derivatives supplied for exact T2 (Eq. 1.45):
       f1R = cos(2θ)              -> d/dθ f1R    = -2 sin(2θ)
       f1θ = 1/(1+R)              -> d/dR(R f1θ) = 1/(1+R)^2
-      D1  = 0.1 R sin(2θ)       -> d/dθ D1     = 0.2 R cos(2θ)
+      D1  = 0.1 R sin(2θ)        -> d/dθ D1     = 0.2 R cos(2θ)
     """
     def f_R1(X, Y):
         return np.cos(2 * (np.arctan2(Y, X) % (2 * np.pi)))
@@ -928,79 +1000,33 @@ def load_compare(Lx, Ly, N):
     D2 = Mobility(_D2)
     return f1, f2, D1, D2, "compare"
 
-def load_conservative1(Lx, Ly, N):
-    def pot1(x, y):
-        k = 2 * np.pi * (2 / Lx)
-        return 2 * np.cos(k * x)**2 * np.cos(k * y)**2
+def load_conservative(Lx, Ly, N):
+    pot = f"cos(12*{1/Lx} * pi  * x)**2*cos(12*{1/Ly} * pi * y)**2"
 
-    def _dpotdth(x,y):
-        k = 2 * np.pi * (5 / Lx)
-        return 4 * k * (np.sin(k*x)*np.cos(k*x)*np.cos(k*y)**2 +np.sin(k*y)*np.cos(k*y)*np.cos(k*x)**2 )
-    def _zero(x, y):
-        return np.zeros_like(x)
-
-    f1 = Force(Lx, Ly, N, N, conservative=True, potential=pot1, _dpotdth = None)
-    f2 = Force(Lx, Ly, N, N, conservative=False, f_x=_zero, f_y=_zero, cartesian=True)
-    D1 = Mobility(lambda X, Y: np.zeros_like(X),
-                  dtheta_func=lambda X, Y: np.zeros_like(X))
-    D2 = Mobility(lambda X, Y: np.zeros_like(X))
-    return f1, f2, D1, D2, "conservative_peaks2"
-
-def load_conservative2(Lx, Ly, N):
-    def pot1(x, y):
-        k = 2 * np.pi * (5 / Lx)
-        return -4 * np.cos(k * x)**2 * np.cos(k * y)**2
-
-    def _zero(x, y):
-        return np.zeros_like(x)
-
-    f1 = Force(Lx, Ly, N, N, conservative=True, potential=pot1)
-    f2 = Force(Lx, Ly, N, N, conservative=False, f_x=_zero, f_y=_zero, cartesian=True)
-    D1 = Mobility(lambda X, Y: np.zeros_like(X),
-                  dtheta_func=lambda X, Y: np.zeros_like(X))
-    D2 = Mobility(lambda X, Y: np.zeros_like(X))
-    return f1, f2, D1, D2, "conservative_wells"
+    f1 = Force(Lx, Ly, N, N, conservative=True, expr_phi=pot)
+    f2 = Force(Lx, Ly, N, N, conservative=False, f_x=nul, f_y=nul, cartesian=True)
+    D1 = Mobility(expr=nul,dtheta_func=nul)
+    D2 = Mobility(expr=nul,dtheta_func=nul)
+    return f1, f2, D1, D2, "conservative_peaks"
 
 def load_mob_only(Lx, Ly, N):
-    """D1 = X = R cos(θ)  ->  d/dθ D1 = -R sin(θ) = -Y"""
-    def _zero(x, y):
-        return np.zeros_like(x)
+        
+    f1 = Force(Lx, Ly, N, N, expr_phi="0", conservative=False)
+    f2 = Force(Lx, Ly, N, N, conservative=True, expr_phi="0")
+    D1 = Mobility(expr="-x",dtheta_func=lambda x,y: y)
+    D2 = Mobility(expr="0",dtheta_func=nul)
 
-    f1 = Force(Lx, Ly, N, N, conservative=False, f_x=_zero, f_y=_zero, cartesian=True)
-    f2 = Force(Lx, Ly, N, N, conservative=False, f_x=_zero, f_y=_zero, cartesian=True)
-    D1 = Mobility(lambda X, Y: X.copy(), dtheta_func=lambda X, Y: -Y.copy())
-    D2 = Mobility(lambda X, Y: np.zeros_like(X))
+
     return f1, f2, D1, D2, "only_mob"
 
 def load_divless(Lx, Ly, N):
+    pot = f"cos(12*{1/Lx} * pi  * x)**2*cos(12*{1/Ly} * pi * y)**2"    
 
-    def pot(x, y):
-        k = 2 * np.pi * (6 / Lx)
-        return np.cos(k * x)**2 * np.sin(k * y)**2
-    
-    def _zero(x, y):
-        return np.zeros_like(x)
-
-    f1 = Force(Lx, Ly, N, N, conservative=False, potential=pot)
-    f2 = Force(Lx, Ly, N, N, conservative=True, potential=_zero)
-    D1 = Mobility(_zero,dtheta_func=_zero)
-    D2 = Mobility(_zero,dtheta_func=_zero)
-    return f1, f2, D1, D2, "div_less4"
-
-def load_divless2(Lx, Ly, N):
-    def pot(x, y):
-        k = 2 * np.pi * (6 / Lx)
-        return np.cos(k * x)**2* np.cos(k * y)**2
-
-    
-    def _zero(x, y):
-        return np.zeros_like(x)
-
-    f1 = Force(Lx, Ly, N, N, conservative=False, potential=pot)
-    f2 = Force(Lx, Ly, N, N, conservative=True, potential=_zero)
-    D1 = Mobility(_zero,dtheta_func=_zero)
-    D2 = Mobility(_zero,dtheta_func=_zero)
-    return f1, f2, D1, D2, "div_less2"
+    f1 = Force(Lx, Ly, N, N, conservative=False, expr_phi=pot)
+    f2 = Force(Lx, Ly, N, N, conservative=True, expr_phi="0")
+    D1 = Mobility(expr="0",dtheta_func=nul)
+    D2 = Mobility(expr="0",dtheta_func=nul)
+    return f1, f2, D1, D2, "div_less"
 
 def load_cisaillement(Lx, Ly, N):
     phi="-y**2/2"
@@ -1017,63 +1043,57 @@ def load_cisaillement(Lx, Ly, N):
 def load_divless_shifted(Lx, Ly, N):
 
 
-    def _zero(x,y):
-        return 0*x
-
     f1 = Force(Lx, Ly, N, N, conservative=False, expr_phi=f"cos(12*{1/Lx} * pi  * x)**2*cos(12*{1/Ly} * pi * y - pi/6)**2", cartesian=True)
-    f2 = Force(Lx, Ly, N, N, conservative=False, expr_phi=_zero)
-    D1 = Mobility(_zero,dtheta_func=_zero)
-    D2 = Mobility(_zero,dtheta_func=_zero)
+    f2 = Force(Lx, Ly, N, N, conservative=False, expr_phi=nul)
+    D1 = Mobility(nul,dtheta_func=nul)
+    D2 = Mobility(nul,dtheta_func=nul)
     return f1, f2, D1, D2, "shifted"
 
 def load_divless_mob(Lx, Ly, N):
-    D1 = "0"
     pot = f"cos(12*{1/Lx} * pi  * x)**2*cos(12*{1/Ly} * pi * y - pi/6)**2"
 
-    def _zero(x, y):
-        return np.zeros_like(x)
 
     f1 = Force(Lx, Ly, N, N, conservative=False, expr_phi=pot)
-    f2 = Force(Lx, Ly, N, N, conservative=True, potential=_zero)
-    D1 = Mobility(expr="0",dtheta_func=_zero)
-    D2 = Mobility(expr="0",dtheta_func=_zero)
-    return f1, f2, D1, D2, "div_less_mob2"
+    f2 = Force(Lx, Ly, N, N, conservative=True, expr_phi="0")
+    D1 = Mobility(expr="0",dtheta_func=nul)
+    D2 = Mobility(expr="0",dtheta_func=nul)
+    return f1, f2, D1, D2, "div_less_mob"
 
 def load_multiples(dx):
-    p1 = ("cos(12*1/10 * pi  * x)**2*cos(12*1/10 * pi * y - pi/6)**2", 
+    p1 = ("cos(12*1/15 * pi  * x)**2*cos(12*1/15 * pi * y - pi/6)**2", 
           False,
-          10)
-    p2 = ("cos(12*1/10 * pi  * x)**2*cos(12*1/10 * pi * y - pi/6)**2", 
+          15)
+    p2 = ("cos(12*1/15 * pi  * x)**2*cos(12*1/15 * pi * y - pi/6)**2", 
           True,
-          10)
-    p3 = ("cos(12*1/10 * pi  * x)**2*cos(12*1/10 * pi * y)**2", 
+          15)
+    p3 = ("cos(12*1/15 * pi  * x)**2*cos(12*1/15 * pi * y)**2", 
           False,
-          10)
+          15)
     p4 = ("cos(48*1/40 * pi  * x)**2*cos(48*1/40 * pi * y)**2", 
           False,
           40)
-    p5 = ("cos(12*1/10 * pi  * x)**2*cos(12*1/10 * pi * y)**2", 
+    p5 = ("cos(12*1/15 * pi  * x)**2*cos(12*1/15 * pi * y)**2", 
           True,
-          10)
+          15)
     p6 = ("cos(48*1/40 * pi  * x)**2*cos(48*1/40 * pi * y)**2", 
           True,
           40)
-    p7 = ("cos(12*1/10 * pi  * x)**3*cos(12*1/10 * pi * y)**3", 
+    p7 = ("cos(12*1/15 * pi  * x)**3*cos(12*1/15 * pi * y)**3", 
           False,
-          10)
+          15)
     p8 = ("cos(20*1/20 * pi  * x)**3*cos(20*1/20 * pi * y - pi/6)**3", 
           False,
           20)
-    p9 = ("cos(12*1/10 * pi  * x)**3*cos(12*1/10 * pi * y)**3", 
+    p9 = ("cos(12*1/15 * pi  * x)**3*cos(12*1/15 * pi * y)**3", 
           True,
-          10)
+          15)
 
-    p10 = ("cos(6*1/10 * pi  * x)**2*cos(6*1/10 * pi * y)**2", 
+    p10 = ("cos(6*1/15 * pi  * x)**2*cos(6*1/15 * pi * y)**2", 
           True,
-          10)
-    p11 = ("cos(6*1/10 * pi  * x)**2*cos(6*1/10 * pi * y)**2", 
+          15)
+    p11 = ("cos(6*1/15 * pi  * x)**2*cos(6*1/15 * pi * y)**2", 
           False,
-          10)
+          15)
     
     p12 = ("cos(20*1/20 * pi  * x)+cos(20*1/20 * pi * y)", 
           True,
@@ -1095,10 +1115,6 @@ def load_multiples(dx):
     p17 = ("cos(20*1/20 * pi  * x)*sin(20*1/20 * pi * y)", 
           False,
           20)
-
-
-    def zero(x, y):
-        return np.zeros_like(x)
     
     args = []
     ps = [p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17]
@@ -1107,48 +1123,80 @@ def load_multiples(dx):
         N = int(L/dx)
         f1 = Force(L, L, N, N, conservative=conservative, expr_phi=pot)
         f2 = Force(L, L, N, N, conservative=False, expr_phi="0")
-        D1 = Mobility(expr="0",dtheta_func=zero)
-        D2 = Mobility(expr="0",dtheta_func=zero)
+        D1 = Mobility(expr="0",dtheta_func=nul)
+        D2 = Mobility(expr="0",dtheta_func=nul)
         args.append([f1, f2, D1, D2, f"data{i}", pot, L, N])
         
     return args
 
+def load_crossed_shear(Lx, Ly, N):
+    phi="-y*x"
+
+    def _zero(x,y):
+        return 0*x
+
+    f1 = Force(Lx, Ly, N, N, expr_phi=phi, conservative=False)
+    f2 = Force(Lx, Ly, N, N, conservative=True, expr_phi="0")
+    D1 = Mobility(expr="0",dtheta_func=_zero)
+    D2 = Mobility(expr="0",dtheta_func=_zero)
+    return f1, f2, D1, D2, "crossed_cisaillement"
+
+def load_bash(L, N):
+    pot = f"cos(2*pi* x)**2*cos(2* pi * y)**2"
+
+
+    f1 = Force(L, L, N, N, conservative=False, expr_phi=pot)
+    f2 = Force(L, L, N, N, conservative=True, expr_phi="0")
+    D1 = Mobility(expr="0",dtheta_func=nul)
+    D2 = Mobility(expr="0",dtheta_func=nul)
+    return f1, f2, D1, D2, "bash"
+
+
 if __name__ == "__main__":
-
     
-    dx = 0.001
+    import sys
+    L = sys.argv[1]
+    pot = sys.argv[2]
+    conservatif = sys.argv[3]
+    saveStr = sys.argv[4]
     D0 = 1.
+    L = 10.
+    pot = "cos(2*pi*x)**2*cos(2*pi*y)**2"
+    conservatif = True
+    saveStr = "post_process_test"
 
-    funcs = load_multiples(dx)
-    for (f1, f2, D1, D2, SaveStr, eq, L, N) in funcs[:6]:
-        print(f"computing {eq}")
-        cn = control_nav(Lx=L, Ly=L, Nx=N, Ny=N, D0=D0 ,D1=D1, D2=D2, f1=f1, f2=f2, epsilon=0.01)
-        print("Computing T1 ...")
-        cn.compute_T1()
-        print("Computing dT1/dθ ...")
-        cn.compute_dT1dTh()
-        print("Computing T2 ...")
-        cn.compute_T2()
-        print("Computing dT2/dθ ...")
-        cn.compute_dT2dTh()
-        print("computing control forces contributions")
+    dx = 0.02
+    N = int(L/dx)
 
-        c0x, c0y = cn.compute_order_contribution(0)
-        c1x, c1y = cn.compute_order_contribution(1)
-        c2x, c2y = cn.compute_order_contribution(2)
+    f1 = Force(L, L, N, N, conservative=conservatif, expr_phi=pot)
+    f2 = Force(L, L, N, N, conservative=True, expr_phi="0")
+    D1 = Mobility(expr="0",dtheta_func=nul)
+    D2 = Mobility(expr="0",dtheta_func=nul)
+    
+   
+        
+    cn = control_nav(Lx=L, Ly=L, Nx=N, Ny=N, D0=D0 ,D1=D1, D2=D2, f1=f1, f2=f2, epsilon=0.01)
+    print("Computing T1 ...")
+    cn.compute_T1()
+    print("Computing dT1/dθ ...")
+    cn.compute_dT1dTh()
+    print("Computing T2 ...")
+    cn.compute_T2()
+    print("Computing dT2/dθ ...")
+    cn.compute_dT2dTh()
+    print("computing control forces contributions")
 
-        data = {
-            "eq":eq,
-            "T0":cn.T0.tolist(),
-            "T1":cn.T1.tolist(),
-            "T2":cn.T2.tolist(),
-            "dT1dTh":cn.dT1dTh.tolist(),
-            "dT2dTh":cn.dT2dTh.tolist(),
-            "c0": (c0x.tolist(), c0y.tolist()),
-            "c1": (c1x.tolist(), c1y.tolist()),
-            "c2": (c2x.tolist(), c2y.tolist()),
-        }
+    data = {
+        "L": L,
+        "N": N,
+        "pot":pot,
+        "T0":cn.T0.tolist(),
+        "T1":cn.T1.tolist(),
+        "T2":cn.T2.tolist(),
+        "dT1dTh":cn.dT1dTh.tolist(),
+        "dT2dTh":cn.dT2dTh.tolist(),
+    }
 
-        with open(f"{SaveStr}.json", "w") as f:
-            json.dump(data, f)
+    with open(f"{saveStr}.json", "w") as f:
+        json.dump(data, f)
         
