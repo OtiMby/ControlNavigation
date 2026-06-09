@@ -23,6 +23,7 @@ from optimized_control_nav import (
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.interpolate import RegularGridInterpolator
 import os 
+from scipy.optimize import curve_fit
 
 # ---------------------------------------------------------------------------
 # Overview figure
@@ -134,13 +135,13 @@ def plot_overview_figure(
         res1D = cn.radial_eps_validity()
 
     if "p1" in quant:
-        t1 = [algo(1, (x0r, y0r), eps, 0.001, 10000, 0.1) for (x0r, y0r) in starting_points]
+        t1 = [algo(1, (x0r, y0r), eps, 0.001, 100000, 0.1) for (x0r, y0r) in starting_points]
     
     if "p2" in quant:
-        t2 = [algo(2, (x0r, y0r), eps, 0.001, 10000, 0.1) for (x0r, y0r) in starting_points]
+        t2 = [algo(2, (x0r, y0r), eps, 0.001, 100000, 0.1) for (x0r, y0r) in starting_points]
     
     if "p0" in quant:
-        t0 = [algo(0, (x0r, y0r), eps, 0.001, 10000, 0.1) for (x0r, y0r) in starting_points]
+        t0 = [algo(0, (x0r, y0r), eps, 0.001, 100000, 0.1) for (x0r, y0r) in starting_points]
 
     if "zp2" in quant:
         R = 0.7 * np.hypot(cn.Lx/2, cn.Ly/2)
@@ -155,15 +156,15 @@ def plot_overview_figure(
         if "p0" in quant:
             t.append([t0[0], "#2980b9", r"$\mathcal{O}(\varepsilon^0)$"])
         else:
-            t.append([algo(0, (x0r, y0r), eps, 0.001, 10000, 0.1), "#2980b9", r"$\mathcal{O}(\varepsilon^0)$"])
+            t.append([algo(0, (x0r, y0r), eps, 0.001, 100000, 0.1), "#2980b9", r"$\mathcal{O}(\varepsilon^0)$"])
         if "p1" in quant:
             t.append([t1[0], "#e67e22", r"$\mathcal{O}(\varepsilon^1)$"])
         else:
-            t.append([algo(1, (x0r, y0r), eps, 0.001, 10000, 0.1), "#e67e22", r"$\mathcal{O}(\varepsilon^1)$"])
+            t.append([algo(1, (x0r, y0r), eps, 0.001, 100000, 0.1), "#e67e22", r"$\mathcal{O}(\varepsilon^1)$"])
         if "p2" in quant:
             t.append([t2[0], "#27ae60", r"$\mathcal{O}(\varepsilon^2)$"])
         else:
-            t.append([algo(2, (x0r, y0r), eps, 0.001, 10000, 0.1), "#27ae60", r"$\mathcal{O}(\varepsilon^2)$"])
+            t.append([algo(2, (x0r, y0r), eps, 0.001, 100000, 0.1), "#27ae60", r"$\mathcal{O}(\varepsilon^2)$"])
     
     if "cp" in quant:
         apaths = compared_paths[0]
@@ -283,8 +284,24 @@ def plot_overview_figure(
                 cut = _make_cut(cut_f, cn.X[:,0])
                 for func in funcs:
                     if func in func_map.keys():
-                        y = RegularGridInterpolator(([X[:,0], Y[0,:]]), func_map[func])(cut)
-                        ax.loglog(np.abs(y[len(y)//2:]), label=func)
+                        yc = RegularGridInterpolator((X[:, 0], Y[0, :]), func_map[func])(cut)
+
+                        x_axis = cn.X[:, 0]                  # abscisse = coordonnée x de la coupe
+                        i0     = len(yc) // 2                # x ≈ 0, début du tracé
+                        ifit   = np.searchsorted(x_axis, 1)   # premier indice avec x >= xfit0
+
+                        xcut = x_axis[i0:]
+                        xfit = x_axis[ifit:]
+                        yfit = np.abs(yc[ifit:])
+
+                        # loi de puissance a * x^b  (2 paramètres)
+                        p, _ = curve_fit(lambda x, a, b: a * x**b, xfit, yfit, p0=[1.0, -3.0])
+                        a, b = p
+                        print(func, "-> a =", a, " b =", b)
+
+                        ax.loglog(xcut, np.abs(yc[i0:]), label=func)
+                        ax.loglog(xfit, a * xfit**b, "--",
+                                label=fr"{func} fit $\sim x^{{{b:.2f}}}$")
                         ax.grid()
                         ax.set_title(rf"cut at {title} of functions {' '.join(funcs)}")
                         ax.legend()
@@ -339,7 +356,7 @@ def plot_overview_figure(
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, saveStr + ".png")
     print(f"Saving -> {out_path}")
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path, dpi=900, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -370,8 +387,7 @@ def post_process(file, conservative,epsilon, plot_grid, cuts, params):
     print("comparing paths")
     err, T, compared_paths = cn.compare_paths(2, cn.make_theta_eq , params['compare']['Np'], epsilon, Npaths=params['plot']['Npath'])
     print("plotting")
-    plot_overview_figure(cn, plot_grid, epsilon, cuts, starting_points, compared_paths, saveStr=file, **params['plot'])
-
+    plot_overview_figure(cn, plot_grid, epsilon, cuts, starting_points, compared_paths, saveStr=file[:-5], **params['plot'])
 
 # ---------------------------------------------------------------------------
 # Entry points
@@ -462,7 +478,7 @@ if __name__ == "__main__":
     cuts=[ # create a cut at cuts[i][0] for func cuts[i][1] with title cuts[i][2]. Refer to 'func_map' to know functions name 
         [lambda x: 0, ['T2'], "y=0"], 
         [lambda x: 0, ['T1'], "y=0"], 
-        [lambda x: 0.2, ['T2'], "y=0.2"]
+        [lambda x: -x, ['T2'], "y=-x"]
     ]
     plot_tables = { # Create a grid plot with same shape as plot_tables[i], each cell of the table plots a specific func 
                     # Refer to logic table in plot function for names
@@ -492,7 +508,7 @@ if __name__ == "__main__":
              # Na : Number of arrows, lw, ow: caracteristics of single path line (size), mlw, mow : caracteristics of multiple path line (size), Npath:Number of path line for 'zp2' plot
              # Np: Number of path to compare ( analytical vs Num)
         "computation": {"Lx":10., "Ly":10., "dx":0.01, "D0":1.0, "eps":0.005},
-        "plot" : {"Na": 100, "lw":1, "ow":1, "mlw":1.1, "mow":1, "Npath": 10},
+        "plot" : {"Na": 120, "lw":1, "ow":1, "mlw":1.1, "mow":1, "Npath": 10},
         "compare" : {"Np":400}
     }
     
