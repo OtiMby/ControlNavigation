@@ -114,7 +114,7 @@ def kernel_T1_cons(X, Y, R, x0, dx, y0, dy, D1_g, phi_g, phi0, D0, Nr):
                 r  = k * dr
                 xc = r * np.cos(th);  yc = r * np.sin(th)
                 buf[k] = -_bl(D1_g, x0, dx, y0, dy, xc, yc)
-            out[i, j] = (_simp(buf, dr) + phi_g[i, j] - phi0) / D0**2
+            out[i, j] = (_simp(buf, dr) - (phi_g[i, j] - phi0)) / D0**2
     return out
 
 
@@ -169,7 +169,7 @@ def kernel_dT1dTh_cons(X, Y, R, x0, dx, y0, dy,
                 r  = k * dr
                 xc = r * np.cos(th);  yc = r * np.sin(th)
                 buf[k] = -_bl(dD1dth_g, x0, dx, y0, dy, xc, yc)
-            out[i, j] = (_simp(buf, dr) + dphi_g[i, j] - dphi0) / D0**2
+            out[i, j] = (_simp(buf, dr) - (dphi_g[i, j] - dphi0)) / D0**2
     return out
 
 
@@ -316,6 +316,7 @@ def kernel_T2_dT2dTh_151(
             h  = 0.0;  h_prev  = 0.0
             h2 = 0.0;  h2_prev = 0.0
 
+            # Compute the integrand of the outer integral for Nr points in [0,R]
             for k in range(Nr):
                 r   = k * dr
                 r_s = r if r > 1e-12 else 1e-12
@@ -335,6 +336,8 @@ def kernel_T2_dT2dTh_151(
                 dd2  = _bl(dD2dth_g,    x0, dx, y0, dy, xc, yc)
 
                 # ── trapezoid update ───────────────────────────────────────
+                # To compute the integrand of the outer integral at r(k), we can use the integrand at r(k-1), because it contains an integral [0,r(k)]
+                # The inner integral is h(k)
                 cur_h  = dd1
                 cur_h2 = d2d1
 
@@ -410,7 +413,6 @@ def kernel_trace_paths(vx, vy, x0, dx, y0, dy,
     ys    = np.empty((M, max_steps + 1))
     nstep = np.empty(M, dtype=np.int64)
     rs2   = r_stop * r_stop
- 
     for m in prange(M):
         x = starts[m, 0]
         y = starts[m, 1]
@@ -418,6 +420,8 @@ def kernel_trace_paths(vx, vy, x0, dx, y0, dy,
         ys[m, 0] = y
         cnt = 0
         for _ in range(max_steps):
+            if _ % 100 == 0:
+                print(_)
             k1x = _bl0(vx, x0, dx, y0, dy, x, y)
             k1y = _bl0(vy, x0, dx, y0, dy, x, y)
             ax  = x + 0.5 * dt * k1x;  ay = y + 0.5 * dt * k1y
@@ -430,12 +434,19 @@ def kernel_trace_paths(vx, vy, x0, dx, y0, dy,
             k4x = _bl0(vx, x0, dx, y0, dy, cx, cy)
             k4y = _bl0(vy, x0, dx, y0, dy, cx, cy)
  
-            x += dt / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
-            y += dt / 6.0 * (k1y + 2.0 * k2y + 2.0 * k3y + k4y)
-            cnt += 1
-            xs[m, cnt] = x
-            ys[m, cnt] = y
+            xn = x + dt / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+            yn = y + dt / 6.0 * (k1y + 2.0 * k2y + 2.0 * k3y + k4y)
+
+            if x*xn + y *yn < 0:
+                print(f"oscille a {int(x*x + y*y)}")
+                break
+            else:
+                x, y = xn, yn
+                cnt += 1
+                xs[m, cnt] = x
+                ys[m, cnt] = y
             if abs(x) > hx or abs(y) > hy or (x * x + y * y) < rs2:
+                print((x * x + y * y))
                 break
         nstep[m] = cnt + 1   # including the start point
  
