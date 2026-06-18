@@ -9,7 +9,7 @@ logique + point d'entrée __main__) est conservée.
 
 import sys
 import os
-
+from scipy.spatial import cKDTree
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -374,16 +374,50 @@ def plot_overview_figure(
                 ax.plot(radius, errs, "+", lw=0, zorder=1)   # numérique
                 ax.plot(radius, Ts,   "o", lw=0, zorder=2)   # exact
 
+            
+            
+            if "ze" in gp[i][j]:
+                thetas = np.array([np.pi/4 - 1e-1, np.pi/4 + 1e-1])
+                paths, sp, e   = cn.zermelo_paths(cn.make_theta_eq, eps, dt, thetas)
+
+                for (tx, ty, th) in paths:
+                    ax.plot(tx, ty, lw=mlw)
+
+                XY, TH, OWN = [], [], []
+                for pi, path in enumerate(paths):
+                    P = np.asarray(path)               # (n, 3) : colonnes x, y, th
+                    print(P[:2, :].shape)
+                    XY.append(P[:2, :].T)
+                    TH.append(P[2, :])
+                    OWN.append(np.full(P.shape[1], pi))
+                print(len(XY))
+                XY  = np.vstack(XY)
+                TH  = np.concatenate(TH)
+                OWN = np.concatenate(OWN)
+
+                voisins = cKDTree(XY).query_pairs(0.01, output_type='ndarray')
+
+                p1, p2 = voisins[:, 0], voisins[:, 1]
+                m = OWN[p1] != OWN[p2]
+                p1, p2 = p1[m], p2[m]
+
+                dtheta = np.angle(np.exp(1j * (TH[p1] - TH[p2])))
+                xy     = 0.5 * (XY[p1] + XY[p2])
+
+
+
+                ax.scatter(xy[:,0],xy[:,1],c=dtheta, s=1, marker="+")
+
             if "cp" in gp[i][j]:  # caractéristiques exactes vs chemins numériques (axe R)
                 
-                thetas = np.array([np.pi/3 - 1e-3, np.pi/4 + 1e-3])
+                thetas = np.array([np.pi/4 - 1e-1, np.pi/4 + 1e-1])
                 err2, T_err2, ang_err2, compared_paths2   = cn.compare_paths(2, cn.make_theta_eq, Npath, eps, paths=True, thetas=thetas)
-                #err1, T_err1, ang_err1, compared_paths1 = cn.compare_paths(1, cn.make_theta_eq, Npath, eps, paths=True)
-                apath    = compared_paths2[0]
+                err1, T_err1, ang_err1, compared_paths1 = cn.compare_paths(1, cn.make_theta_eq, Npath, eps,paths=True, thetas=thetas)
+                apath    = compared_paths2[0][:,:,:1]
                 numpath2 = compared_paths2[1] #order 2
-                #numpath1 = compared_paths1[1] #order 1
+                numpath1 = compared_paths1[1] #order 1
 
-                info = [[apath, "viridis", None],[numpath2, "YlOrRd", T_err2]]
+                info = [[apath[:1,], "viridis", None],[numpath2, "YlOrRd", T_err2], [numpath1, "Blues", T_err1]]
                 for (paths, style,err) in info:
                     for k, (xs, ys) in enumerate(paths):
                         speed = np.hypot(np.gradient(xs), np.gradient(ys)) / dt
@@ -460,7 +494,7 @@ if __name__ == "__main__":
             [["T"],          ["Ttot-0"],  ["T1"],         ["T2"]],
             [["cp", "F1"],   ["p1", "T"], ["p2", "T"],   ["zp2", "F1"]],
         ],
-        "single": [[["area", "cp", "F1"]]],
+        "single": [[["ze", "F1"]]],
         "big grid": [
             [["F1R"],   ["F1T"],   ["F1"],         ["pot1"]],
             [["T1"],    ["T2"],    ["T", "area"],  []],
@@ -477,9 +511,9 @@ if __name__ == "__main__":
         # Na  : nombre de flèches ; lw, ow : épaisseur/marqueur d'un chemin simple
         # mlw, mow : idem pour les chemins multiples ; Npath : nb de chemins 'zp2'
         # Nradius : nb de rayons pour 'radius cp' (>0 requis si 'radius cp' utilisé)
-        "eps": 0.01, "Na": 120, "lw": 0.7, "ow": 0.7,
+        "eps": 0.01, "Na": 80, "lw": 0.7, "ow": 0.7,
         "mlw": 2, "mow": 2, "Npath": 12, "Nradius": 10,
-        "dt":0.005
+        "dt":0.001
     }
     if len(sys.argv) > 2:
         params["eps"] = float(sys.argv[2])

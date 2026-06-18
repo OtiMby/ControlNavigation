@@ -137,7 +137,7 @@ class simulation:
         return np.array(xs), np.array(ys)
 
 
-    def trace_paths(self, vx, vy, starts, dt=0.05, steps=800, r_stop=0.1):
+    def perturbative_paths(self, vx, vy, starts, dt=0.05, steps=800, r_stop=0.1):
         vx = np.ascontiguousarray(vx, dtype=np.float64)
         vy = np.ascontiguousarray(vy, dtype=np.float64)
         xr, yr = self.X[:, 0], self.Y[0, :]
@@ -151,10 +151,132 @@ class simulation:
             float(dt), int(steps), float(r_stop),
             self.Lx / 2.0, self.Ly / 2.0)
 
-        return list(zip(xs, ys))
+        return xs, ys, n
 
 
     # ── Validity radius ───────────────────────────────────────────────────────
+    def zermelo_paths(self, theta_dot, eps, dt, thetas):
+
+        box_x, box_y = 0.9*self.Lx/2.0, 0.9*self.Ly/2.0
+
+        tf = thetas.copy()
+        M  = tf.size
+
+        print(dt)
+        # --- caractéristiques exactes : rétrograde depuis la cible ----------
+        Nt = int(self.Lx/dt)
+        
+        Xh, Yh, th = np.zeros((Nt + 1, M)), np.zeros((Nt + 1, M)), np.zeros((Nt + 1, M))
+        th[0,:] = tf                                  # shooting angles ( at the target )
+
+        # --------- intégration rétrograde de zermelo ---------  -> Xh, Yh trajectoires
+        def flow(x, y, t):
+            """Flot optimal RÉTROGRADE d/dτ = -(flot avant), vectorisé sur les M caractéristiques.
+            État (x, y, θ) :
+                dx/dτ = -(F_x + D·cosθ)
+                dy/dτ = -(F_y + D·sinθ)
+                dθ/dτ = -func(θ, x, y, ε)
+            avec D = D0 + εD1 + ε²D2,  F = εf1 + ε²f2.
+            """
+            V  = self.D0 + eps*self.D1(x, y) + eps**2*self.D2(x, y)
+            fx = eps*self.f1.fx(x, y) + eps**2*self.f2.fx(x, y)
+            fy = eps*self.f1.fy(x, y) + eps**2*self.f2.fy(x, y)
+            c, s = np.cos(t), np.sin(t)
+            return -(fx + V*c), -(fy + V*s), -theta_dot(t, x, y, eps)
+
+        for k in range(Nt):
+            if k%100==0:
+                print(k)
+            xk, yk, thk = Xh[k], Yh[k], th[k]
+            a1x, a1y, a1t = flow(xk,              yk,              thk)
+            a2x, a2y, a2t = flow(xk + .5*dt*a1x,  yk + .5*dt*a1y,  thk + .5*dt*a1t)
+            a3x, a3y, a3t = flow(xk + .5*dt*a2x,  yk + .5*dt*a2y,  thk + .5*dt*a2t)
+            a4x, a4y, a4t = flow(xk +    dt*a3x,  yk +    dt*a3y,  thk +    dt*a3t)
+            Xh[k+1] = xk + (dt/6.)*(a1x + 2*a2x + 2*a3x + a4x)
+            Yh[k+1] = yk + (dt/6.)*(a1y + 2*a2y + 2*a3y + a4y)
+            th[k+1] = thk + (dt/6.)*(a1t + 2*a2t + 2*a3t + a4t)
+
+        outside = (np.abs(Xh) > box_x) | (np.abs(Yh) > box_y)
+        too_far = (np.abs(Xh) > self.Lx) | (np.abs(Yh) > self.Ly)
+
+        left    = outside.any(0) # 1D array where 1 if outside, 0 if not
+        wrong = too_far.any(0).any()
+        print(wrong)
+        e       = np.where(left, outside.argmax(0), Nt) # 2D array where k_step ( number of steps to go outside
+        print()
+        if not left.all():
+            _warnings.warn(
+                f"compare_paths: {int((~left).sum())}/{M} caractéristiques "
+                "n'ont pas atteint la boîte (nmax trop petit ou extrémale "
+                "divergente) ; marquées NaN.", RuntimeWarning, stacklevel=2)
+        sp = np.ascontiguousarray(
+            np.column_stack([Xh[e, np.arange(M)], Yh[e, np.arange(M)]]),
+            dtype=np.float64)
+
+        return [[Xh[:e[k]+1, k], Yh[:e[k]+1, k], th[:e[k]+1, k]] for k in range(M)], sp, e
+
+    def compare_paths(self, order, theta_dot, eps, dt=0.01, r_stop=0.0001, paths=False, thetas=[]):
+        """Compare les trajectoires perturbatives (RK4 sur velocity_field) aux
+        caractéristiques optimales EXACTES de
+            ẋ = D(x)·(cosθ, sinθ) + F(x),   |c| = 1.
+
+        Caractéristiques obtenues par intégration RÉTROGRADE du flot optimal
+        depuis la cible (origine), avec la MÊME loi `func` (make_theta_eq) que
+        celle définissant le modèle — cohérence vitesse/pilotage à mobilité
+        variable. Renvoie (err, dtau) par trajectoire (RMS spatial resamplé par
+        abscisse curviligne, erreur temporelle relative). Les trajectoires non
+        valides (jamais sorties de la boîte, ou RK4 n'atteignant pas la cible)
+        valent NaN -> utiliser np.nanmean en aval.
+        """
+        
+        anpath, sp, e = self.zermelo_paths(theta_dot, eps, dt, thetas)
+        M = thetas.size
+
+        # --- RK4 perturbatif depuis les lancements vers la cible ------------  -> xs, ys -> trajectoires
+        
+        vx, vy = self.velocity_field(order, eps)
+        xs, ys, nstep = self.perturbative_paths(vx, vy, sp, dt, self.Lx/dt, r_stop)
+
+        spatial_err = []
+        time_err = []
+        ang_err = []
+
+        for k in range(M):
+            
+            #ang_err.append(np.abs(th[k] - np.atan2(icy(*sp[k]), icx(*sp[k]))))
+            #z_area = -simpson(Yh[e,k], x=Xh[e, k])
+            #num_area = simpson(ys[k], x=xs[k])
+            #spatial_err.append(np.abs(z_area - num_area))
+            
+                time_err.append((e[k] - nstep[k])*dt) # longueur d'une trajectoire
+        if paths:
+            rk4    = [[xs[k][:nstep[k]], ys[k][:nstep[k]]] for k in range(M)]
+            return spatial_err, time_err, ang_err, [anpath, rk4]
+        
+        return spatial_err, time_err, ang_err
+
+    def make_theta_eq(self,th,x,y, e):
+        """Loi de pilotage de Zermelo à VITESSE VARIABLE pour le modèle
+            ẋ = D(x)·(cosθ, sinθ) + F(x),   |c| = 1,   D = D0 + ε D1 + ε² D2.
+
+            θ̇ = sin²θ ∂ₓv + sinθcosθ(∂ₓu − ∂yv) − cos²θ ∂yu
+                + (sinθ ∂ₓD − cosθ ∂yD)
+
+        avec u=F_x=εf1x+ε²f2x, v=F_y=εf1y+ε²f2y, D=D0+εD1+ε²D2.
+        """
+
+        dudx = e*self.f1.dfx_dx(x, y) + e**2*self.f2.dfx_dx(x, y)
+        dudy = e*self.f1.dfx_dy(x, y) + e**2*self.f2.dfx_dy(x, y)
+        dvdx = e*self.f1.dfy_dx(x, y) + e**2*self.f2.dfy_dx(x, y)
+        dvdy = e*self.f1.dfy_dy(x, y) + e**2*self.f2.dfy_dy(x, y)
+
+        dDdx = e*self.D1.dx(x, y) + e**2*self.D2.dx(x, y)
+        dDdy = e*self.D1.dy(x, y) + e**2*self.D2.dy(x, y)
+
+        s, c     = np.sin(th), np.cos(th)
+        classical = s*s*dvdx + s*c*(dudx - dvdy) - c*c*dudy
+        mobility  = s*dDdx - c*dDdy
+        return classical + mobility
 
     def compute_eps(self):
         """
@@ -204,149 +326,7 @@ class simulation:
 
         return epsesTot, epsesT10, constraining
 
-    def compare_paths(self, order, theta_dot, n_theta, eps, dt=0.01, r_stop=0.0001, paths=False, random=False, thetas=[]):
-        """Compare les trajectoires perturbatives (RK4 sur velocity_field) aux
-        caractéristiques optimales EXACTES de
-            ẋ = D(x)·(cosθ, sinθ) + F(x),   |c| = 1.
 
-        Caractéristiques obtenues par intégration RÉTROGRADE du flot optimal
-        depuis la cible (origine), avec la MÊME loi `func` (make_theta_eq) que
-        celle définissant le modèle — cohérence vitesse/pilotage à mobilité
-        variable. Renvoie (err, dtau) par trajectoire (RMS spatial resamplé par
-        abscisse curviligne, erreur temporelle relative). Les trajectoires non
-        valides (jamais sorties de la boîte, ou RK4 n'atteignant pas la cible)
-        valent NaN -> utiliser np.nanmean en aval.
-        """
-        box_x, box_y = 0.9*self.Lx/2.0, 0.9*self.Ly/2.0
-        GAP          = 1e-3   # écart aux singularités cosθ=0, INDÉPENDANT de eps
-        vx, vy = self.velocity_field(order, eps)
-
-        vmax = np.hypot(vx, vy).max()
-        if not random:
-            tf = np.concatenate([np.linspace(-np.pi/2 + GAP,   np.pi/2 - GAP,   n_theta//2),
-                                np.linspace( np.pi/2 + GAP, 3*np.pi/2 - GAP,   n_theta//2)])
-        if random:
-            tf = np.random.rand(n_theta) * 2*np.pi
-
-        if len(thetas):
-            tf = thetas.copy()
-
-        M  = tf.size
-
-        # --- caractéristiques exactes : rétrograde depuis la cible ----------
-        Nt = int(self.Lx/dt)
-        
-        Xh, Yh = np.zeros((Nt + 1, M)), np.zeros((Nt + 1, M))
-        th = tf.copy()                                  # cap AU but, pas de +pi
-
-        # --------- intégration rétrograde de zermelo ---------  -> Xh, Yh trajectoires
-        def flow(x, y, t):
-            """Flot optimal RÉTROGRADE d/dτ = -(flot avant), vectorisé sur les M caractéristiques.
-            État (x, y, θ) :
-                dx/dτ = -(F_x + D·cosθ)
-                dy/dτ = -(F_y + D·sinθ)
-                dθ/dτ = -func(θ, x, y, ε)
-            avec D = D0 + εD1 + ε²D2,  F = εf1 + ε²f2.
-            """
-            V  = self.D0 + eps*self.D1(x, y) + eps**2*self.D2(x, y)
-            fx = eps*self.f1.fx(x, y) + eps**2*self.f2.fx(x, y)
-            fy = eps*self.f1.fy(x, y) + eps**2*self.f2.fy(x, y)
-            c, s = np.cos(t), np.sin(t)
-            return -(fx + V*c), -(fy + V*s), -theta_dot(t, x, y, eps)
-
-        for k in range(Nt):
-            if k%100==0:
-                print(k)
-            xk, yk = Xh[k], Yh[k]
-            a1x, a1y, a1t = flow(xk,              yk,              th)
-            a2x, a2y, a2t = flow(xk + .5*dt*a1x,  yk + .5*dt*a1y,  th + .5*dt*a1t)
-            a3x, a3y, a3t = flow(xk + .5*dt*a2x,  yk + .5*dt*a2y,  th + .5*dt*a2t)
-            a4x, a4y, a4t = flow(xk +    dt*a3x,  yk +    dt*a3y,  th +    dt*a3t)
-            Xh[k+1] = xk + (dt/6.)*(a1x + 2*a2x + 2*a3x + a4x)
-            Yh[k+1] = yk + (dt/6.)*(a1y + 2*a2y + 2*a3y + a4y)
-            th      = th + (dt/6.)*(a1t + 2*a2t + 2*a3t + a4t)
-
-        outside = (np.abs(Xh) > box_x) | (np.abs(Yh) > box_y)
-        too_far = (np.abs(Xh) > self.Lx) | (np.abs(Yh) > self.Ly)
-
-        left    = outside.any(0) # 1D array where 1 if outside, 0 if not
-        wrong = too_far.any(0).any()
-        print(wrong)
-        e       = np.where(left, outside.argmax(0), Nt) # 2D array where k_step ( number of steps to go outside
-        print()
-        if not left.all():
-            _warnings.warn(
-                f"compare_paths: {int((~left).sum())}/{M} caractéristiques "
-                "n'ont pas atteint la boîte (nmax trop petit ou extrémale "
-                "divergente) ; marquées NaN.", RuntimeWarning, stacklevel=2)
-        sp = np.ascontiguousarray(
-            np.column_stack([Xh[e, np.arange(M)], Yh[e, np.arange(M)]]),
-            dtype=np.float64)
-        
-        print("zermelo computed")
-        # --- RK4 perturbatif depuis les lancements vers la cible ------------  -> xs, ys -> trajectoires
-        
-        vx = np.ascontiguousarray(vx, dtype=np.float64)
-        vy = np.ascontiguousarray(vy, dtype=np.float64)
-        xr, yr = self.X[:, 0], self.Y[0, :]
-        x0, dx = float(xr[0]), float(xr[1] - xr[0])
-        y0, dy = float(yr[0]), float(yr[1] - yr[0])
-        print("RK4")
-        xs, ys, nstep = kernel_trace_paths(
-            vx, vy, x0, dx, y0, dy, sp,
-            float(dt), int(2*Nt), float(r_stop), self.Lx/2.0, self.Ly/2.0)
-
-        spatial_err = []
-        time_err = []
-        ang_err = []
-
-        cx, cy = self.compute_control_force(order, eps)
-        kw     = dict(bounds_error=False, fill_value=0.)
-        icx    = RegularGridInterpolator((xr, yr), cx, **kw)
-        icy    = RegularGridInterpolator((xr, yr), cy, **kw)
-
-        for k in range(M):
-            
-            #ang_err.append(np.abs(th[k] - np.atan2(icy(*sp[k]), icx(*sp[k]))))
-            #z_area = -simpson(Yh[e,k], x=Xh[e, k])
-            #num_area = simpson(ys[k], x=xs[k])
-            #spatial_err.append(np.abs(z_area - num_area))
-            if left[k] and nstep[k] >0:
-                time_err.append((e[k] - nstep[k])*dt) # longueur d'une trajectoire
-            else:
-                time_err.append(np.nan)
-        
-        if paths:
-            anpath = [(Xh[:e[k]+1, k], Yh[:e[k]+1, k]) for k in range(M)]
-            rk4    = [(xs[k][:nstep[k]], ys[k][:nstep[k]]) for k in range(M)]
-            return spatial_err, time_err, ang_err, [anpath, rk4]
-        
-        return spatial_err, time_err, ang_err
-
-    def make_theta_eq(self,th,x,y, e):
-        """Loi de pilotage de Zermelo à VITESSE VARIABLE pour le modèle
-            ẋ = D(x)·(cosθ, sinθ) + F(x),   |c| = 1,   D = D0 + ε D1 + ε² D2.
-
-            θ̇ = sin²θ ∂ₓv + sinθcosθ(∂ₓu − ∂yv) − cos²θ ∂yu
-                + (sinθ ∂ₓD − cosθ ∂yD)
-
-        avec u=F_x=εf1x+ε²f2x, v=F_y=εf1y+ε²f2y, D=D0+εD1+ε²D2.
-        """
-
-        dudx = e*self.f1.dfx_dx(x, y) + e**2*self.f2.dfx_dx(x, y)
-        dudy = e*self.f1.dfx_dy(x, y) + e**2*self.f2.dfx_dy(x, y)
-        dvdx = e*self.f1.dfy_dx(x, y) + e**2*self.f2.dfy_dx(x, y)
-        dvdy = e*self.f1.dfy_dy(x, y) + e**2*self.f2.dfy_dy(x, y)
-
-        dDdx = e*self.D1.dx(x, y) + e**2*self.D2.dx(x, y)
-        dDdy = e*self.D1.dy(x, y) + e**2*self.D2.dy(x, y)
-
-        s, c     = np.sin(th), np.cos(th)
-        classical = s*s*dvdx + s*c*(dudx - dvdy) - c*c*dudy
-        mobility  = s*dDdx - c*dDdy
-        return classical + mobility
-
-                
 
 if __name__ == "__main__":
     import sys
