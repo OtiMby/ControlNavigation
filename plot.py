@@ -23,7 +23,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.colors import PowerNorm
-
+from numba_kernel import trajectory_intersections
 
 # ---------------------------------------------------------------------------
 # Overview figure
@@ -42,7 +42,8 @@ def plot_overview_figure(
     lw=1.5, ow=1.5,
     mlw=0.7, mow=0.5,
     Npath=10,
-    dt=0.01
+    dt=0.01,
+    Ninter=200
 ):
     X, Y   = cn.X, cn.Y
     EXTENT = [-cn.Lx / 2, cn.Lx / 2, -cn.Ly / 2, cn.Ly / 2]
@@ -90,8 +91,8 @@ def plot_overview_figure(
         ax.tick_params(length=2)
         ax.plot(0, 0, "D", ms=2, color="black", zorder=5)
 
-    def _ishow(ax, data, cmap):
-        im = ax.imshow(data.T, cmap=cmap, extent=EXTENT, origin="lower")
+    def _ishow(ax, data, cmap, min=None, max=None):
+        im = ax.imshow(data.T, cmap=cmap, extent=EXTENT, origin="lower", vmax=max, vmin=min)
         _add_colorbar(ax, im)
 
     def _decompose_force(force):
@@ -214,7 +215,10 @@ def plot_overview_figure(
                 _style(ax, r"$\phi_2(\vec{x})$",  bottom=True)
 
             if "T" in gp[i][j]:
-                _ishow(ax, tTot, "YlOrRd")
+                Tmin = np.sqrt(2)*4.5*0.5 * 0.8
+                Tmax = np.sqrt(2)*4.5*0.5 * 1.2
+                
+                _ishow(ax, tTot, "YlOrRd", min=Tmin, max=Tmax)
                 _style(ax, rf"$\mathcal{{T}}^*$  ($\varepsilon={eps:.2g}$)",  bottom=True)
 
             if "Ttot-0" in gp[i][j]:
@@ -226,6 +230,7 @@ def plot_overview_figure(
                 _style(ax,   r"$\mathcal{T}^*_1$", bottom=True)
 
             if "T2" in gp[i][j]:
+                
                 _ishow(ax, T2, "YlOrRd")
                 _style(ax,   r"$\mathcal{T}^*_2$", bottom=True)
 
@@ -319,26 +324,27 @@ def plot_overview_figure(
                 cut = _make_cut(cut_f, cn.X[:, 0])
                 for func in funcs:
                     if func in func_map:
-                        yc = RegularGridInterpolator((X[:, 0], Y[0, :]), func_map[func])(cut)
+                        yc = RegularGridInterpolator((cn.X[:, 0], cn.Y[0, :]), func_map[func])(cut)
 
                         x_axis = cn.X[:, 0]                 # abscisse = coordonnée x de la coupe
-                        i0     = len(yc) // 2               # x ≈ 0, début du tracé
-                        ifit   = np.searchsorted(x_axis, 1)  # premier indice avec x >= R ( ici R=1)
+                        i0     = 0              # x ≈ 0, début du tracé
+                        #ifit   = np.searchsorted(x_axis, 1)  # premier indice avec x >= R ( ici R=1)
 
                         xcut = x_axis[i0:]
-                        xfit = x_axis[ifit:]
+                        """xfit = x_axis[ifit:]
                         yfit = np.abs(yc[ifit:])
 
                         # loi de puissance a * x^b  (2 paramètres)
                         p, _ = curve_fit(lambda x, a, b: a * x**b, xfit, yfit, p0=[1.0, -3.0])
                         a, b = p
-                        print(func, "-> a =", a, " b =", b)
+                        print(func, "-> a =", a, " b =", b)"""
 
                         ax.plot(xcut, np.abs(yc[i0:]), label=func)
                         #ax.plot(xfit, a * xfit**b, "--",
                                   #label=fr"{func} fit $\sim x^{{{b:.2f}}}$")
                         ax.grid()
                         ax.set_title(rf"cut at {title} of functions {' '.join(funcs)}")
+                        ax.set_xlim(2, 4)
                         ax.legend()
                         ax.set_xlabel("Radius")
                 count += 1
@@ -383,64 +389,56 @@ def plot_overview_figure(
                 for (tx, ty, th) in paths:
                     ax.plot(tx, ty, lw=mlw)
 
-                XY, TH, OWN = [], [], []
-                for pi, path in enumerate(paths):
-                    P = np.asarray(path)               # (n, 3) : colonnes x, y, th
-                    print(P[:2, :].shape)
-                    XY.append(P[:2, :].T)
-                    TH.append(P[2, :])
-                    OWN.append(np.full(P.shape[1], pi))
-                print(len(XY))
-                XY  = np.vstack(XY)
-                TH  = np.concatenate(TH)
-                OWN = np.concatenate(OWN)
-
-                voisins = cKDTree(XY).query_pairs(0.01, output_type='ndarray')
-
-                p1, p2 = voisins[:, 0], voisins[:, 1]
-                m = OWN[p1] != OWN[p2]
-                p1, p2 = p1[m], p2[m]
-
-                dtheta = np.angle(np.exp(1j * (TH[p1] - TH[p2])))
-                xy     = 0.5 * (XY[p1] + XY[p2])
-
-
-
-                ax.scatter(xy[:,0],xy[:,1],c=dtheta, s=1, marker="+")
-
             if "cp" in gp[i][j]:  # caractéristiques exactes vs chemins numériques (axe R)
                 
                 thetas = np.array([np.pi/4 - 1e-1, np.pi/4 + 1e-1])
                 err2, T_err2, ang_err2, compared_paths2   = cn.compare_paths(2, cn.make_theta_eq, Npath, eps, paths=True, thetas=thetas)
                 err1, T_err1, ang_err1, compared_paths1 = cn.compare_paths(1, cn.make_theta_eq, Npath, eps,paths=True, thetas=thetas)
-                apath    = compared_paths2[0][:,:,:1]
+                apath    = compared_paths2[0][:,:,:1] # on enleve theta de zermelo paths
                 numpath2 = compared_paths2[1] #order 2
                 numpath1 = compared_paths1[1] #order 1
 
-                info = [[apath[:1,], "viridis", None],[numpath2, "YlOrRd", T_err2], [numpath1, "Blues", T_err1]]
+                info = [[apath, "viridis", None],[numpath2, "YlOrRd", T_err2], [numpath1, "Blues", T_err1]]
                 for (paths, style,err) in info:
                     for k, (xs, ys) in enumerate(paths):
+
+                        # crée une colormap en fonction de la vitesse en chaque point de la trajectoire
                         speed = np.hypot(np.gradient(xs), np.gradient(ys)) / dt
                         speed = speed[1:-1]; xs = xs[1:-1]; ys = ys[1:-1]
 
-                        pts  = np.column_stack([xs, ys]).reshape(-1, 1, 2)
+                        pts  = np.column_stack([xs, ys]).reshape(-1, 1, 2) # segments de trajectoires
                         segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
-                        seg_speed = 0.5 * (speed[:-1] + speed[1:])
 
+                        seg_speed = 0.5 * (speed[:-1] + speed[1:])
                         lo, hi = np.percentile(seg_speed, [5, 95])
                         if hi <= lo:                                   # garde-fou : vitesse ~constante
                             lo, hi = seg_speed.min(), seg_speed.max() + 1e-12
 
-                        norm = PowerNorm(gamma=4, vmin=lo, vmax=hi, clip=True)   
+                        norm = PowerNorm(gamma=4, vmin=lo, vmax=hi, clip=True)    
                         lc = LineCollection(segs, cmap=style, norm=norm)
                         lc.set_array(seg_speed)
                         lc.set_linewidth(mlw)
                         ax.add_collection(lc)
                         if err:
-                            if err[k] > 0:
-                                lc.set_alpha(0)
+                            if err[k] > 0: # si erreur positive ( dans ce cas différence temporelle)
+                                lc.set_alpha(0) # transparent
                             else:
                                 lc.set_alpha(1)
+
+            if "interp" in gp[i][j]:
+                thetas = np.random.rand(100)*2*np.pi
+                paths, sp, e   = cn.zermelo_paths(cn.make_theta_eq, eps, dt, thetas)
+                trajs = []
+                for (tx, ty, th) in paths:
+                    ax.plot(tx, ty, lw=mlw)
+                    trajs.append(np.array(list(zip(tx, ty))))                    
+
+                xy_inter = trajectory_intersections(trajs, 2)
+                print(len(xy_inter))
+                for (i,j, (x,y)) in xy_inter:
+                    ax.scatter(x, y, marker="o", s=10, c="red", zorder=5)
+
+                    
 
     fig.suptitle(
         rf"Perturbative control navigation — $\varepsilon={eps:.2g}$"
@@ -469,11 +467,10 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         file = f"datas/{sys.argv[1]}.json"  
     else:
-        file = "datas/div_less.json"
+        file = "datas/Conservative_peaks.json"
 
     cuts = [  # [fonction de coupe, [fonctions à tracer], titre] ; cf. 'func_map'
-        [lambda x: 0,    ["T2"], "y=0"],
-        [lambda x: 0, ["T1"], "y=0"],
+        [lambda x: np.sqrt(4.5**2/2 - x**2) if x**2<4.5**2/2 else 0,    ["T2"], "y=theta"],
         [lambda x: -x,    ["T2"], "y=-x"],
     ]
 
@@ -494,7 +491,7 @@ if __name__ == "__main__":
             [["T"],          ["Ttot-0"],  ["T1"],         ["T2"]],
             [["cp", "F1"],   ["p1", "T"], ["p2", "T"],   ["zp2", "F1"]],
         ],
-        "single": [[["ze", "F1"]]],
+        "single": [[["interp", "pot1"]]],
         "big grid": [
             [["F1R"],   ["F1T"],   ["F1"],         ["pot1"]],
             [["T1"],    ["T2"],    ["T", "area"],  []],
@@ -511,9 +508,9 @@ if __name__ == "__main__":
         # Na  : nombre de flèches ; lw, ow : épaisseur/marqueur d'un chemin simple
         # mlw, mow : idem pour les chemins multiples ; Npath : nb de chemins 'zp2'
         # Nradius : nb de rayons pour 'radius cp' (>0 requis si 'radius cp' utilisé)
-        "eps": 0.01, "Na": 80, "lw": 0.7, "ow": 0.7,
-        "mlw": 2, "mow": 2, "Npath": 12, "Nradius": 10,
-        "dt":0.001
+        "eps": 0.04, "Na": 80, "lw": 0.7, "ow": 0.7,
+        "mlw": 0.7, "mow": 2, "Npath": 12, "Nradius": 10,
+        "dt":0.001, "Ninter":200
     }
     if len(sys.argv) > 2:
         params["eps"] = float(sys.argv[2])

@@ -166,18 +166,11 @@ class simulation:
         # --- caractéristiques exactes : rétrograde depuis la cible ----------
         Nt = int(self.Lx/dt)
         
-        Xh, Yh, th = np.zeros((Nt + 1, M)), np.zeros((Nt + 1, M)), np.zeros((Nt + 1, M))
-        th[0,:] = tf                                  # shooting angles ( at the target )
+        Xh, Yh, Th = np.zeros((Nt + 1, M)), np.zeros((Nt + 1, M)), np.zeros((Nt + 1, M))
+        Th[0,:] = tf                                  # shooting angles ( at the target )
 
         # --------- intégration rétrograde de zermelo ---------  -> Xh, Yh trajectoires
         def flow(x, y, t):
-            """Flot optimal RÉTROGRADE d/dτ = -(flot avant), vectorisé sur les M caractéristiques.
-            État (x, y, θ) :
-                dx/dτ = -(F_x + D·cosθ)
-                dy/dτ = -(F_y + D·sinθ)
-                dθ/dτ = -func(θ, x, y, ε)
-            avec D = D0 + εD1 + ε²D2,  F = εf1 + ε²f2.
-            """
             V  = self.D0 + eps*self.D1(x, y) + eps**2*self.D2(x, y)
             fx = eps*self.f1.fx(x, y) + eps**2*self.f2.fx(x, y)
             fy = eps*self.f1.fy(x, y) + eps**2*self.f2.fy(x, y)
@@ -185,16 +178,30 @@ class simulation:
             return -(fx + V*c), -(fy + V*s), -theta_dot(t, x, y, eps)
 
         for k in range(Nt):
-            if k%100==0:
+            if k%1000==0:
                 print(k)
-            xk, yk, thk = Xh[k], Yh[k], th[k]
+            xk, yk, thk = Xh[k], Yh[k], Th[k]
             a1x, a1y, a1t = flow(xk,              yk,              thk)
             a2x, a2y, a2t = flow(xk + .5*dt*a1x,  yk + .5*dt*a1y,  thk + .5*dt*a1t)
             a3x, a3y, a3t = flow(xk + .5*dt*a2x,  yk + .5*dt*a2y,  thk + .5*dt*a2t)
             a4x, a4y, a4t = flow(xk +    dt*a3x,  yk +    dt*a3y,  thk +    dt*a3t)
             Xh[k+1] = xk + (dt/6.)*(a1x + 2*a2x + 2*a3x + a4x)
             Yh[k+1] = yk + (dt/6.)*(a1y + 2*a2y + 2*a3y + a4y)
-            th[k+1] = thk + (dt/6.)*(a1t + 2*a2t + 2*a3t + a4t)
+            Th[k+1] = thk + (dt/6.)*(a1t + 2*a2t + 2*a3t + a4t)
+        
+
+
+        """def fx(x,y):
+            return eps*self.f1.fx(x, y) + eps**2*self.f2.fx(x, y)
+        
+        def fy(x,y):
+            return eps*self.f1.fy(x, y) + eps**2*self.f2.fy(x, y)
+        
+        def D(x,y):
+            return self.D0 + eps*self.D1(x, y) + eps**2*self.D2(x, y)
+        
+        Xh, Yh, Th = zermelo_kernel(fx, fy, D, theta_dot, Nt, dt, eps, Xh, Yh, Th)"""
+
 
         outside = (np.abs(Xh) > box_x) | (np.abs(Yh) > box_y)
         too_far = (np.abs(Xh) > self.Lx) | (np.abs(Yh) > self.Ly)
@@ -203,7 +210,6 @@ class simulation:
         wrong = too_far.any(0).any()
         print(wrong)
         e       = np.where(left, outside.argmax(0), Nt) # 2D array where k_step ( number of steps to go outside
-        print()
         if not left.all():
             _warnings.warn(
                 f"compare_paths: {int((~left).sum())}/{M} caractéristiques "
@@ -213,7 +219,7 @@ class simulation:
             np.column_stack([Xh[e, np.arange(M)], Yh[e, np.arange(M)]]),
             dtype=np.float64)
 
-        return [[Xh[:e[k]+1, k], Yh[:e[k]+1, k], th[:e[k]+1, k]] for k in range(M)], sp, e
+        return [[Xh[:e[k]+1, k], Yh[:e[k]+1, k], Th[:e[k]+1, k]] for k in range(M)], sp, e
 
     def compare_paths(self, order, theta_dot, eps, dt=0.01, r_stop=0.0001, paths=False, thetas=[]):
         """Compare les trajectoires perturbatives (RK4 sur velocity_field) aux

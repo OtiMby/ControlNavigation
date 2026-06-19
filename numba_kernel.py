@@ -409,6 +409,7 @@ def kernel_trace_paths(vx, vy, x0, dx, y0, dy,
     nstep  : (M,) int64                 number of valid points per path
     """
     M = starts.shape[0]
+    print(M)
     xs    = np.empty((M, max_steps + 1))
     ys    = np.empty((M, max_steps + 1))
     nstep = np.empty(M, dtype=np.int64)
@@ -419,6 +420,7 @@ def kernel_trace_paths(vx, vy, x0, dx, y0, dy,
         xs[m, 0] = x
         ys[m, 0] = y
         cnt = 0
+        print(cnt)
         for _ in range(max_steps):
             if _ % 100 == 0:
                 print(_)
@@ -451,3 +453,174 @@ def kernel_trace_paths(vx, vy, x0, dx, y0, dy,
         nstep[m] = cnt + 1   # including the start point
  
     return xs, ys, nstep
+
+@njit(parallel=True, cache=True)
+def zermelo_kernel(Fx, Fy, D, theta_eq, Nt, dt, eps, Xh, Yh, Th):
+    # --------- intégration rétrograde de zermelo ---------  -> Xh, Yh trajectoires
+    def flow(x, y, t):
+        """Flot optimal RÉTROGRADE d/dτ = -(flot avant), vectorisé sur les M caractéristiques.
+        État (x, y, θ) :
+            dx/dτ = -(F_x + D·cosθ)
+            dy/dτ = -(F_y + D·sinθ)
+            dθ/dτ = -func(θ, x, y, ε)
+        avec D = D0 + εD1 + ε²D2,  F = εf1 + ε²f2.
+        """
+        V  = D(x,y)
+        fx, fy = Fx(x,y), Fy(x,y)
+        theta_dot = theta_eq(x,y)
+        c, s = np.cos(t), np.sin(t)
+        return -(fx + V*c), -(fy + V*s), -theta_dot(t, x, y, eps)
+
+    for k in range(Nt):
+        xk, yk, th = Xh[k], Yh[k], Th[k]
+        a1x, a1y, a1t = flow(xk,              yk,              th)
+        a2x, a2y, a2t = flow(xk + .5*dt*a1x,  yk + .5*dt*a1y,  th + .5*dt*a1t)
+        a3x, a3y, a3t = flow(xk + .5*dt*a2x,  yk + .5*dt*a2y,  th + .5*dt*a2t)
+        a4x, a4y, a4t = flow(xk +    dt*a3x,  yk +    dt*a3y,  th +    dt*a3t)
+        Xh[k+1] = xk + (dt/6.)*(a1x + 2*a2x + 2*a3x + a4x)
+        Yh[k+1] = yk + (dt/6.)*(a1y + 2*a2y + 2*a3y + a4y)
+        Th[k+1] = th + (dt/6.)*(a1t + 2*a2t + 2*a3t + a4t)
+    
+    return Xh, Yh, Th
+
+import itertools
+import numpy as np
+from numba import njit, prange
+
+
+@njit(inline='always')
+def _orient(ax, ay, bx, by, cx, cy):
+    """Produit vectoriel (b-a) × (c-a) : orientation entre deux droites (AB) et (AC) ( pas les segments de la trajectoires)."""
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+
+@njit(cache=True)
+def _build_grid(B, ox, oy, inv, ncx, ncy):
+    """
+    Crée une grille dont les cellules contiennent les segments de la trajectoire ( B ) qui passent par cette cellule.
+    B : trajectoire
+    ox, oy : origine en x et y des cellules
+    inv : taille d'une cellule
+    ncx, ncy : nombre de cellule selon x et selon y
+
+    La sortie est deux listes count et items
+    items est une liste de (liste de segments). Chaque item de items correspond à une cellule
+    count(i,j) contient l'indice de items ou se trouve la cellule (i,j)
+
+    Les deux listes de sortie sont des tableaux 2D applatis en 1D
+    
+    """
+    Mb = B.shape[0] - 1 # nombre de segments d'un chemin
+    ncell = ncx * ncy # nombre de cellules 
+    counts = np.zeros(ncell + 1, np.int64) # contient au debut le nombre de segments inclus pour chaque cellule. Tableau 2D applati en 1D
+    for b in range(Mb): # pour chacun des segments b de B
+        x1, y1, x2, y2 = B[b, 0], B[b, 1], B[b+1, 0], B[b+1, 1] # coordonées du segment b
+        # toute cellule dont l'indice selon x se trouve entre cx0 et cx1 contiennent le segment b
+        cx0 = int((min(x1, x2) - ox) * inv); cx1 = int((max(x1, x2) - ox) * inv) 
+        # toute cellule dont l'indice selon y se trouve entre cy0 et cy1 contiennent le segment b
+        cy0 = int((min(y1, y2) - oy) * inv); cy1 = int((max(y1, y2) - oy) * inv) 
+        for cx in range(cx0, cx1 + 1): # pour chaque cellule contenant le segment b
+            for cy in range(cy0, cy1 + 1):
+                counts[cx * ncy + cy + 1] += 1 # comme c'est un tableau 2D applati l'indice (ix,iy) devient ix*nx + iy
+    
+    # somme cumulative, aprés la boucle counts contient l'indice de la cellule k dans liste items
+    for k in range(ncell): 
+        counts[k + 1] += counts[k]  
+    
+    # chaque élément de  items est une liste de segment correspondant à la cellule (i,j), tableau 2D applati en 1D
+    items = np.empty(counts[ncell], np.int64) 
+    cursor = counts[:ncell].copy()
+    for b in range(Mb): # pour chaque segment on calcule les cellules concernées
+        x1, y1, x2, y2 = B[b, 0], B[b, 1], B[b+1, 0], B[b+1, 1]
+        cx0 = int((min(x1, x2) - ox) * inv); cx1 = int((max(x1, x2) - ox) * inv)
+        cy0 = int((min(y1, y2) - oy) * inv); cy1 = int((max(y1, y2) - oy) * inv)
+        for cx in range(cx0, cx1 + 1): # pour chaque cellule concernée on lui rajoute le segment k
+            for cy in range(cy0, cy1 + 1):
+                c = cx * ncy + cy
+                items[cursor[c]] = b; cursor[c] += 1 
+    return counts, items
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _query(A, B, counts, items, ox, oy, inv, ncx, ncy, out_xy, offs, cnt, do_fill):
+    """Pour chaque segment de A : ne teste que les segments de B des cellules voisines.
+    Se fait en deux appels. Vu qu'on ne sait pas combien d'intersections on va avoir, on commence par faire un premier appel pour les compter puis 
+    Un second pour remplir la liste des coordonées des intersections out_xy. Comme le calcul est parralélisé, 
+    on ne peut pas créer la liste dynamiquement avec out_xy.append(intersection).
+    Il faut initialiser correctement la liste out_xy et donner une place dans cette liste à chaque intersection 
+    pour que les threads ne se marchent pas dessus
+    """
+    Ma = A.shape[0] - 1
+    
+    for a in prange(Ma):                      # parallélisé sur les cœurs
+        # On commence par calculer les cellules concernées par le segment a de A
+        x1, y1, x2, y2 = A[a, 0], A[a, 1], A[a+1, 0], A[a+1, 1]
+        axmin = min(x1, x2); axmax = max(x1, x2)
+        aymin = min(y1, y2); aymax = max(y1, y2)
+        cx0 = max(0, int((axmin - ox) * inv)); cx1 = min(ncx - 1, int((axmax - ox) * inv))
+        cy0 = max(0, int((aymin - oy) * inv)); cy1 = min(ncy - 1, int((aymax - oy) * inv))
+        c = 0
+        for cx in range(cx0, cx1 + 1): # pour chaque cellule c concernée par le segment a
+            for cy in range(cy0, cy1 + 1):
+                cell = cx * ncy + cy
+                for idx in range(counts[cell], counts[cell + 1]): # pour chacun des indices des segments passant ( issus de B ) par  la cellule c
+                    b = items[idx] # on récupere le segment
+                    x3, y3, x4, y4 = B[b, 0], B[b, 1], B[b+1, 0], B[b+1, 1] # coordonées du segment en question
+                    if axmax < min(x3, x4) or axmin > max(x3, x4): continue # si intersection impossible on passe au prochain segment
+                    if aymax < min(y3, y4) or aymin > max(y3, y4): continue # pareil
+
+                    # test d'orientation
+                    d1 = _orient(x3, y3, x4, y4, x1, y1); d2 = _orient(x3, y3, x4, y4, x2, y2)
+                    d3 = _orient(x1, y1, x2, y2, x3, y3); d4 = _orient(x1, y1, x2, y2, x4, y4)
+                    if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)): # si y'a intersection
+                        # on récupère le lieu de l'intersection
+                        t = d1 / (d1 - d2)
+                        px = x1 + t * (x2 - x1)
+                        py = y1 + t * (y2 - y1)
+                        # dédup : on ne compte le croisement que dans SA cellule
+                        if int((px - ox) * inv) != cx or int((py - oy) * inv) != cy: # si le lieu du croisement n'est pas dans la cellule c
+                            continue
+                        if do_fill: # si on est sur le remplissage
+                            p = offs[a] + c; out_xy[p, 0] = px; out_xy[p, 1] = py # on remplit la place qui est allouée à l'interserction
+                        c += 1
+        if not do_fill: # si on est pas sur le remplissage, on calcule juste combien de place va falloir allouer et quelles sont ces places
+            cnt[a] = c
+
+
+def pair_intersections(A, B, target_per_cell=2.0):
+    """Croisements entre 2 trajectoires (arrays (P,2)). Renvoie un array (K,2)."""
+    pts = np.vstack((A, B)) # concatenne les deux trajectoires. (Na+Nb, 2)
+    
+    # permet de construire la boite englobante des deux trajectoires
+    # ox, oy origines en x et y de la grand boite
+    # w, h hauteur et largeur de la grande boite
+    ox, oy = pts[:, 0].min(), pts[:, 1].min() 
+    w = pts[:, 0].max() - ox + 1e-9; h = pts[:, 1].max() - oy + 1e-9 
+    
+    nseg = (A.shape[0] - 1) + (B.shape[0] - 1) # nombre de segments total à considerer
+    
+    # nombre de cellule selon le plus grand coté de la grande boite
+    side = max(1, int(np.sqrt(max(1, nseg / target_per_cell)))) 
+    
+    inv = side / max(h,w) # inverse de la taille d'une cellule
+    ncx = int(w * inv) + 1; ncy = int(h * inv) + 1 # nombres de cellule selon x, y
+    counts, items = _build_grid(B, ox, oy, inv, ncx, ncy) # on constuit la grille
+    Ma = A.shape[0] - 1
+    cnt = np.zeros(Ma, np.int64)
+    _query(A, B, counts, items, ox, oy, inv, ncx, ncy,
+           np.empty((1, 2)), np.zeros(Ma, np.int64), cnt, False)   # passe 1 : compter pour savoir quelles sont les places de count allouée à chaque intersection
+    offs = np.zeros(Ma, np.int64); np.cumsum(cnt[:-1], out=offs[1:]) # contient la place de chaque intersection dans la liste out_xy
+    out_xy = np.empty((int(cnt.sum()), 2)) # contient les coordonées des intersections
+    _query(A, B, counts, items, ox, oy, inv, ncx, ncy,
+           out_xy, offs, cnt, True)                                # passe 2 : remplir  les espace alloué à chaque intersection
+    return out_xy
+
+
+def trajectory_intersections(trajectories, target_per_cell=2.0):
+    """N trajectoires (chacune array (P,2)) -> liste de (i, j, (x, y))."""
+    res = []
+    for i, j in itertools.combinations(range(len(trajectories)), 2):
+        pts = pair_intersections(np.asarray(trajectories[i], float),
+                                 np.asarray(trajectories[j], float), target_per_cell)
+        res.extend((i, j, (pts[k, 0], pts[k, 1])) for k in range(pts.shape[0]))
+    return res
